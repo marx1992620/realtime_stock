@@ -1204,6 +1204,7 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'app.web'`
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -1276,11 +1277,14 @@ class MarketState:
 
 
 def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
-    app = FastAPI(title="台股即時大單追蹤")
-
-    @app.on_event("startup")
-    async def _bind_loop() -> None:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # 廣播器要在事件迴圈起來後才能綁定。使用 lifespan 而非
+        # @app.on_event("startup")：後者在 FastAPI 0.109+ 已棄用。
         broadcaster.bind_loop(asyncio.get_running_loop())
+        yield
+
+    app = FastAPI(title="台股即時大單追蹤", lifespan=lifespan)
 
     @app.get("/")
     def index() -> FileResponse:
