@@ -269,7 +269,10 @@ git commit -m "feat: add verified trade-side and large-order classification"
 - Test: `tests/test_aggregator.py`
 
 **Interfaces:**
-- Consumes: `app.classify.classify_side / trade_value_twd / is_large_order / BUY / SELL / AUCTION / UNKNOWN`
+- Consumes: `app.classify.classify_side / trade_value_twd / BUY / SELL / AUCTION / UNKNOWN`
+  （**刻意不用 `is_large_order`**：它讀 `trade["size"]`，而 `set_threshold` 手上是
+  正規化紀錄、該欄位叫 `lots`，直接套用會 `KeyError`。兩處一律以 `value_twd`
+  與門檻比較，保持單一寫法。）
 - Produces:
   - `class SymbolAggregator(symbol: str, large_order_twd: float)`
     - `add_trade(trade: dict) -> dict | None` — 回傳正規化紀錄；重複 serial 回傳 `None`
