@@ -5,6 +5,9 @@ name = "pypi"
 
 [packages]
 fugle-marketdata = "*"
+pyarrow = "*"
+fastapi = "*"
+uvicorn = "*"
 
 [dev-packages]
 

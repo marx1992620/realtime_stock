@@ -1,2 +1,5 @@
 fugle-marketdata
 certifi
+pyarrow
+fastapi
+uvicorn
