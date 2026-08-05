@@ -128,3 +128,30 @@ def test_recent_trades_are_capped_and_newest_first():
         agg.add_trade({**AT_ASK, "serial": serial, "time": serial})
     recent = agg.snapshot()["recent_trades"]
     assert [r["serial"] for r in recent] == [3, 2]
+
+
+def test_snapshot_is_independent_of_later_mutations():
+    agg = SymbolAggregator("2330", large_order_twd=1_000_000)
+    agg.add_trade(AT_ASK)
+    snap1 = agg.snapshot()
+    row1 = snap1["ladder"][0]
+    trade1 = snap1["recent_trades"][0]
+
+    # Store original values from snapshot
+    original_buy_lots = row1["buy_lots"]
+    original_trade_serial = trade1["serial"]
+    original_large_count = len(snap1["large_ladder"])
+
+    # Mutate the aggregator with a new trade
+    agg.add_trade(AT_BID)
+
+    # Change the threshold, which should recompute is_large fields
+    agg.set_threshold(10_000_000)
+
+    # Verify the old snapshot was not mutated
+    assert row1["buy_lots"] == original_buy_lots
+    assert trade1["serial"] == original_trade_serial
+    assert trade1["is_large"] is True  # original value unchanged
+    assert snap1["large_ladder"] == [{"price": 2405, "buy_lots": 2, "sell_lots": 0,
+                                      "auction_lots": 0, "unknown_lots": 0}]
+    assert snap1["large_ladder"] != agg.snapshot()["large_ladder"]  # current is different

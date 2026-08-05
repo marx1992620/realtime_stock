@@ -22,7 +22,7 @@ def _empty_level(price: float) -> dict:
 
 def _ladder_rows(levels: dict) -> list[dict]:
     """價位階梯，價高在上（與券商看盤習慣一致）。"""
-    return [levels[p] for p in sorted(levels, reverse=True)]
+    return [dict(levels[p]) for p in sorted(levels, reverse=True)]
 
 
 class SymbolAggregator:
@@ -109,7 +109,7 @@ class SymbolAggregator:
             "large_order_twd": self.large_order_twd,
             "totals": totals,
             "trade_count": len(self.trades),
-            "recent_trades": list(reversed(self.trades[-self.recent_limit:])),
-            "recent_large_trades": list(reversed(
-                [t for t in self.trades if t["is_large"]][-self.recent_limit:])),
+            "recent_trades": [dict(t) for t in reversed(self.trades[-self.recent_limit:])],
+            "recent_large_trades": [dict(t) for t in reversed(
+                [t for t in self.trades if t["is_large"]][-self.recent_limit:])],
         }
