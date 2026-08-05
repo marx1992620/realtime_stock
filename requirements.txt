@@ -1,0 +1,2 @@
+fugle-marketdata
+certifi
