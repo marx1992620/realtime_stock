@@ -26,6 +26,8 @@ PUSH_INTERVAL_SECONDS = 0.2
 
 class ThresholdIn(BaseModel):
     large_order_twd: float = Field(gt=0)
+    # 未指定 symbol 表示套用全部；指定時只改該檔（高低價股的合理門檻差很多）。
+    symbol: str | None = None
 
 
 class Broadcaster:
@@ -73,13 +75,26 @@ class MarketState:
     走同一把鎖，否則重算大單階梯時被切斷會造成永久性的重複計數。
     """
 
-    def __init__(self, symbols: list[str], large_order_twd: float) -> None:
+    def __init__(self, symbols: list[str],
+                 large_order_twd: float | dict[str, float]) -> None:
         self.symbols = list(symbols)
-        self.large_order_twd = large_order_twd
+        # 純數字 = 全部同一個門檻；dict 則必須涵蓋每一檔（缺漏就 KeyError，
+        # 悄悄套用某個預設值只會讓錯誤的門檻在盤中無聲生效）。
+        self._thresholds = {
+            s: (large_order_twd[s] if isinstance(large_order_twd, dict)
+                else large_order_twd)
+            for s in self.symbols
+        }
         self._lock = threading.Lock()
         self._aggregators = {
-            s: SymbolAggregator(s, large_order_twd) for s in self.symbols
+            s: SymbolAggregator(s, self._thresholds[s]) for s in self.symbols
         }
+
+    @property
+    def thresholds(self) -> dict[str, float]:
+        """逐檔門檻的複本 —— 外部改動不得影響內部狀態。"""
+        with self._lock:
+            return dict(self._thresholds)
 
     def aggregator(self, symbol: str) -> SymbolAggregator:
         """未加鎖的直接存取，僅供測試與單執行緒檢視。
@@ -106,11 +121,18 @@ class MarketState:
             aggregator.update_book(book)
             return True
 
-    def set_threshold(self, threshold_twd: float) -> None:
+    def set_threshold(self, threshold_twd: float, symbol: str | None = None) -> None:
+        """symbol 為 None 時套用全部；指定時只重算該檔。未追蹤代碼 raise KeyError。"""
         with self._lock:
-            self.large_order_twd = threshold_twd
-            for aggregator in self._aggregators.values():
-                aggregator.set_threshold(threshold_twd)
+            if symbol is None:
+                targets = list(self._aggregators)
+            elif symbol in self._aggregators:
+                targets = [symbol]
+            else:
+                raise KeyError(symbol)
+            for name in targets:
+                self._thresholds[name] = threshold_twd
+                self._aggregators[name].set_threshold(threshold_twd)
 
     # -- 讀取（加鎖）------------------------------------------------------
     def snapshot(self, symbol: str) -> dict:
@@ -144,7 +166,7 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
 
     @app.get("/api/symbols")
     def symbols() -> dict:
-        return {"symbols": state.symbols, "large_order_twd": state.large_order_twd}
+        return {"symbols": state.symbols, "thresholds": state.thresholds}
 
     @app.get("/api/snapshot/{symbol}")
     def snapshot(symbol: str) -> dict:
@@ -157,16 +179,26 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
 
     @app.post("/api/threshold")
     def set_threshold(body: ThresholdIn) -> dict:
-        state.set_threshold(body.large_order_twd)
-        for symbol in state.symbols:
+        try:
+            state.set_threshold(body.large_order_twd, body.symbol)
+        except KeyError:
+            raise HTTPException(
+                status_code=404, detail=f"symbol not tracked: {body.symbol}"
+            ) from None
+        for symbol in ([body.symbol] if body.symbol is not None else state.symbols):
             broadcaster.publish(symbol)
-        return {"large_order_twd": state.large_order_twd}
+        return {"thresholds": state.thresholds}
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
         await websocket.accept()
-        await websocket.send_json({"type": "init", "snapshots": state.snapshot_all(),
-                                   "large_order_twd": state.large_order_twd})
+        # snapshot* 會取 MarketState 的鎖，而門檻重算持鎖（實測單檔 5 萬筆
+        # 27 ms）。在事件迴圈上等這把鎖會讓所有連線與所有 HTTP 請求一起停擺，
+        # 因此把等待丟到工作執行緒。同步 def 路由本來就跑在工作執行緒上。
+        snapshots, thresholds = await asyncio.to_thread(
+            lambda: (state.snapshot_all(), state.thresholds))
+        await websocket.send_json({"type": "init", "snapshots": snapshots,
+                                   "thresholds": thresholds})
         queue = broadcaster.subscribe()
         try:
             while True:
@@ -177,8 +209,9 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
                 while not queue.empty():
                     pending.add(queue.get_nowait())
                 for name in pending:
+                    snapshot = await asyncio.to_thread(state.snapshot, name)
                     await websocket.send_json({"type": "update",
-                                               "snapshot": state.snapshot(name)})
+                                               "snapshot": snapshot})
         except WebSocketDisconnect:
             pass
         finally:

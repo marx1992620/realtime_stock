@@ -35,6 +35,18 @@ def test_export_includes_taipei_time_column(tmp_path):
     assert row["time_taipei"].startswith("2026-08-05T11:56:49")
 
 
+def test_export_has_no_is_large_column(tmp_path):
+    """CSV_FIELDS 由 TRADE_SCHEMA.names 衍生 —— 欄位移除後必須自動跟隨。"""
+    source = tmp_path / "trades.parquet"
+    with ParquetTradeWriter(source) as writer:
+        writer.append(RECORD)
+    target = tmp_path / "trades.csv"
+    export_csv(source, target)
+    reader = csv.DictReader(target.open(encoding="utf-8"))
+    assert "is_large" not in reader.fieldnames
+    assert next(iter(reader))["value_twd"] == "4810000.0"
+
+
 def test_export_missing_source_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         export_csv(tmp_path / "nope.parquet", tmp_path / "out.csv")

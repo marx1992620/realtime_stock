@@ -25,11 +25,6 @@
 <header>
   <strong>台股即時大單追蹤</strong>
   <div class="tabs" id="tabs"></div>
-  <label>大單門檻
-    <input id="threshold" type="number" min="1" step="100000" style="width: 9rem">
-    元
-  </label>
-  <button id="apply">套用</button>
   <span id="status" class="muted">連線中…</span>
 </header>
 
@@ -89,10 +84,32 @@ function bookTable(snap) {
     <table><tr><th>檔位</th><th>價格</th><th>張數</th></tr>${rows.join("")}</table>`;
 }
 
+// 重繪前後保留使用者的位置與輸入。整塊替換 innerHTML 每秒最多發生 5 次
+// （五檔更新頻繁，0.2 秒合併一次），不保留的話全日價位階梯與 200 列明細
+// 在盤中根本捲不動，門檻也打不完一個數字。
+function scrollOffsets(panels) {
+  return [...panels.querySelectorAll("section")].map(section => {
+    const box = section.querySelector(".scroll");
+    return box ? box.scrollTop : 0;
+  });
+}
+
+function restoreScroll(panels, offsets) {
+  panels.querySelectorAll("section").forEach((section, i) => {
+    const box = section.querySelector(".scroll");
+    if (box && offsets[i]) box.scrollTop = offsets[i];
+  });
+}
+
 function render() {
   const snap = state.snapshots[state.active];
   if (!snap) return;
-  document.getElementById("panels").innerHTML = `
+  const panels = document.getElementById("panels");
+  const offsets = scrollOffsets(panels);
+  const input = document.getElementById("threshold");
+  const typing = input && document.activeElement === input ? input.value : null;
+
+  panels.innerHTML = `
     <section>
       <h2>${snap.symbol}</h2>
       <div class="price">${snap.last_price ?? "—"}</div>
@@ -103,12 +120,42 @@ function render() {
         <tr><th>集合競價</th><td>${fmt(snap.totals.auction_lots)} 張</td></tr>
         ${snap.totals.unknown_lots ? `<tr><th>未分類</th><td>${fmt(snap.totals.unknown_lots)} 張</td></tr>` : ""}
       </table>
+      <div style="margin-top:.5rem">
+        <label>大單門檻
+          <input id="threshold" type="number" min="1" step="100000"
+                 style="width: 9rem" value="${snap.large_order_twd}">
+          元
+        </label>
+        <button id="apply">套用</button>
+        <div class="muted">只影響 ${snap.symbol}；各檔可分別設定</div>
+      </div>
     </section>
     <section>${bookTable(snap)}</section>
     <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
     <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${money(snap.large_order_twd)} 元）`)}</section>
     <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>
     <section>${tradeTable(snap.recent_large_trades, "近期大單明細")}</section>`;
+
+  restoreScroll(panels, offsets);
+  const fresh = document.getElementById("threshold");
+  if (typing !== null) {          // 使用者正在打字，別把輸入吃掉
+    fresh.value = typing;
+    fresh.focus();
+  }
+  fresh.onkeydown = event => { if (event.key === "Enter") applyThreshold(); };
+  document.getElementById("apply").onclick = applyThreshold;
+}
+
+async function applyThreshold() {
+  const input = document.getElementById("threshold");
+  const value = Number(input.value);
+  if (!(value > 0)) return;
+  input.blur();                   // 送出後讓伺服器回來的值接手
+  await fetch("/api/threshold", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ large_order_twd: value, symbol: state.active }),
+  });
 }
 
 function renderTabs() {
@@ -130,22 +177,12 @@ ws.onmessage = event => {
     state.snapshots = msg.snapshots;
     state.symbols = Object.keys(msg.snapshots);
     state.active = state.active ?? state.symbols[0];
-    document.getElementById("threshold").value = msg.large_order_twd;
+    // 門檻不另存：每檔快照都帶自己的 large_order_twd，面板直接讀那個。
     renderTabs();
   } else if (msg.type === "update") {
     state.snapshots[msg.snapshot.symbol] = msg.snapshot;
     if (msg.snapshot.symbol !== state.active) return;
   }
   render();
-};
-
-document.getElementById("apply").onclick = async () => {
-  const value = Number(document.getElementById("threshold").value);
-  if (!(value > 0)) return;
-  await fetch("/api/threshold", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ large_order_twd: value }),
-  });
 };
 </script>

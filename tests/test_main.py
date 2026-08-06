@@ -15,7 +15,9 @@ BOOK = {"symbol": "2330", "bids": [{"price": 2390, "size": 226}],
 def test_parse_args_accepts_comma_separated_symbols():
     args = parse_args(["--symbols", "2330,2317,2454", "--large-order", "1000000"])
     assert args.symbols == ["2330", "2317", "2454"]
-    assert args.large_order == 1_000_000
+    # 單一數字 = 全部套用同一個門檻，解析後一律展開成逐檔對照表
+    assert args.large_order == {"2330": 1_000_000, "2317": 1_000_000,
+                                "2454": 1_000_000}
 
 
 def test_parse_args_strips_whitespace_around_symbols():
@@ -25,6 +27,49 @@ def test_parse_args_strips_whitespace_around_symbols():
 def test_parse_args_rejects_non_positive_threshold():
     with pytest.raises(SystemExit):
         parse_args(["--symbols", "2330", "--large-order", "0"])
+
+
+# -- 逐檔門檻 -------------------------------------------------------------
+
+def test_parse_args_accepts_per_symbol_thresholds():
+    """2330 一張 240 萬、2317 一張 25.8 萬 —— 同一個門檻對兩者沒有意義。"""
+    args = parse_args(["--symbols", "2330,2317",
+                       "--large-order", "2330=5000000,2317=800000"])
+    assert args.large_order == {"2330": 5_000_000, "2317": 800_000}
+
+
+def test_parse_args_mixes_default_with_overrides():
+    args = parse_args(["--symbols", "2330,2317,2454",
+                       "--large-order", "1000000,2330=5000000"])
+    assert args.large_order == {"2330": 5_000_000, "2317": 1_000_000,
+                                "2454": 1_000_000}
+
+
+def test_parse_args_rejects_two_defaults():
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "2330", "--large-order", "1000000,2000000"])
+
+
+def test_parse_args_rejects_non_positive_per_symbol_threshold():
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "2330", "--large-order", "2330=0"])
+
+
+def test_parse_args_rejects_symbol_without_any_threshold(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "2330,2317", "--large-order", "2330=5000000"])
+    assert "2317" in capsys.readouterr().err, "報錯必須指名缺門檻的代碼"
+
+
+def test_parse_args_rejects_threshold_for_untracked_symbol(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "2330", "--large-order", "1000000,2454=800000"])
+    assert "2454" in capsys.readouterr().err
+
+
+def test_default_threshold_applies_to_every_symbol():
+    assert parse_args(["--symbols", "2330,2317"]).large_order == {
+        "2330": 1_000_000, "2317": 1_000_000}
 
 
 def build_pipeline(tmp_path, symbols=("2330",), threshold=1_000_000):
@@ -40,9 +85,13 @@ def test_pipeline_aggregates_and_persists_trade(tmp_path):
     pipeline.close()
 
     assert state.snapshot("2330")["ladder"][0]["buy_lots"] == 2
-    row = pq.read_table(tmp_path / "trades_2330.parquet").to_pylist()[0]
+    table = pq.read_table(tmp_path / "trades_2330.parquet")
+    row = table.to_pylist()[0]
     assert row["side"] == "buy"
     assert row["value_twd"] == 4_810_000
+    # 記憶體紀錄仍帶 is_large，但落檔的是可重算的 value_twd 而非當下門檻的旗標
+    assert "is_large" not in table.column_names
+    assert state.aggregator("2330").trades[0]["is_large"] is True
 
 
 def test_pipeline_updates_book(tmp_path):

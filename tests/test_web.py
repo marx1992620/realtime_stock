@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.web import Broadcaster, MarketState, create_app
@@ -21,7 +22,7 @@ def test_symbols_endpoint_lists_tracked_symbols():
     _, client = build()
     body = client.get("/api/symbols").json()
     assert body["symbols"] == ["2330", "2317"]
-    assert body["large_order_twd"] == 1_000_000
+    assert body["thresholds"] == {"2330": 1_000_000, "2317": 1_000_000}
 
 
 def test_snapshot_endpoint_returns_ladder_and_book():
@@ -48,13 +49,131 @@ def test_threshold_endpoint_recomputes_every_symbol():
 
     response = client.post("/api/threshold", json={"large_order_twd": 1_000_000})
     assert response.status_code == 200
-    assert response.json()["large_order_twd"] == 1_000_000
+    assert response.json()["thresholds"] == {"2330": 1_000_000, "2317": 1_000_000}
     assert state.snapshot("2330")["large_ladder"][0]["buy_lots"] == 2
 
 
 def test_threshold_endpoint_rejects_non_positive():
     _, client = build()
     assert client.post("/api/threshold", json={"large_order_twd": 0}).status_code == 422
+
+
+# -- 逐檔門檻 -------------------------------------------------------------
+
+def test_per_symbol_thresholds_from_mapping():
+    """高低價股共用一個門檻沒有意義：2330 一張 240 萬，2317 一張 25.8 萬。"""
+    state = MarketState(["2330", "2317"],
+                        large_order_twd={"2330": 5_000_000, "2317": 800_000})
+    assert state.thresholds == {"2330": 5_000_000, "2317": 800_000}
+    assert state.snapshot("2330")["large_order_twd"] == 5_000_000
+    assert state.snapshot("2317")["large_order_twd"] == 800_000
+
+
+def test_thresholds_mapping_must_cover_every_symbol():
+    with pytest.raises(KeyError):
+        MarketState(["2330", "2317"], large_order_twd={"2330": 5_000_000})
+
+
+def test_thresholds_property_returns_a_copy():
+    state = MarketState(["2330"], large_order_twd=1_000_000)
+    state.thresholds["2330"] = 42
+    assert state.thresholds == {"2330": 1_000_000}
+
+
+def test_set_threshold_for_one_symbol_leaves_the_others_alone():
+    state = MarketState(["2330", "2317"], large_order_twd=1_000_000)
+    state.set_threshold(5_000_000, "2330")
+    assert state.thresholds == {"2330": 5_000_000, "2317": 1_000_000}
+    assert state.snapshot("2317")["large_order_twd"] == 1_000_000
+
+
+def test_set_threshold_for_untracked_symbol_raises():
+    state = MarketState(["2330"], large_order_twd=1_000_000)
+    with pytest.raises(KeyError):
+        state.set_threshold(5_000_000, "9999")
+
+
+def test_threshold_endpoint_can_target_a_single_symbol():
+    state, client = build(threshold=10_000_000)
+    state.aggregator("2330").add_trade(AT_ASK)          # 481 萬
+
+    body = client.post("/api/threshold",
+                       json={"large_order_twd": 1_000_000, "symbol": "2330"}).json()
+    assert body["thresholds"] == {"2330": 1_000_000, "2317": 10_000_000}
+    assert state.snapshot("2330")["large_ladder"][0]["buy_lots"] == 2
+    assert state.snapshot("2317")["large_order_twd"] == 10_000_000
+
+
+def test_threshold_endpoint_for_untracked_symbol_is_404():
+    _, client = build()
+    response = client.post("/api/threshold",
+                           json={"large_order_twd": 1_000_000, "symbol": "9999"})
+    assert response.status_code == 404
+
+
+def test_threshold_change_of_one_symbol_publishes_only_that_symbol():
+    state = MarketState(["2330", "2317"], large_order_twd=1_000_000)
+    broadcaster = RecordingBroadcaster()
+    client = TestClient(create_app(state, broadcaster))
+    client.post("/api/threshold", json={"large_order_twd": 5_000_000, "symbol": "2317"})
+    assert broadcaster.published == ["2317"]
+
+
+class RecordingBroadcaster(Broadcaster):
+    def __init__(self) -> None:
+        super().__init__()
+        self.published: list[str] = []
+
+    def publish(self, symbol: str) -> None:
+        self.published.append(symbol)
+        super().publish(symbol)
+
+
+def test_websocket_init_carries_every_threshold():
+    state = MarketState(["2330", "2317"],
+                        large_order_twd={"2330": 5_000_000, "2317": 800_000})
+    client = TestClient(create_app(state, Broadcaster()))
+    with client.websocket_connect("/ws") as ws:
+        first = ws.receive_json()
+    assert first["thresholds"] == {"2330": 5_000_000, "2317": 800_000}
+
+
+# -- 事件迴圈 -------------------------------------------------------------
+
+class LoopWatchingState(MarketState):
+    """記錄快照是在事件迴圈的執行緒上取的，還是在工作執行緒上。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.taken_on_event_loop: list[str] = []
+
+    def _note(self, what: str) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.taken_on_event_loop.append(what)
+
+    def snapshot(self, symbol: str) -> dict:
+        self._note(f"snapshot:{symbol}")
+        return super().snapshot(symbol)
+
+    def snapshot_all(self) -> dict:
+        self._note("snapshot_all")
+        return super().snapshot_all()
+
+
+def test_websocket_never_takes_the_lock_on_the_event_loop():
+    """snapshot 會取 threading.Lock，而門檻重算持鎖（實測單檔 5 萬筆 27 ms）。
+    在事件迴圈上等這把鎖會讓所有連線與所有 HTTP 請求一起停擺。"""
+    state = LoopWatchingState(["2330"], large_order_twd=1_000_000)
+    broadcaster = Broadcaster()
+    with TestClient(create_app(state, broadcaster)) as client:
+        with client.websocket_connect("/ws") as ws:
+            assert ws.receive_json()["type"] == "init"
+            broadcaster.publish("2330")
+            assert ws.receive_json()["type"] == "update"
+    assert state.taken_on_event_loop == []
 
 
 def test_index_page_is_served():

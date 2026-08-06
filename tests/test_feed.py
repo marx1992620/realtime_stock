@@ -128,6 +128,101 @@ def test_untracked_symbol_is_ignored(fake_sdk):
     assert trades == []
 
 
+TRADE_EVENT = json.dumps({
+    "event": "data", "channel": "trades",
+    "data": {"symbol": "2330", "price": 2405, "size": 1, "bid": 2400,
+             "ask": 2405, "time": 5, "serial": 10},
+})
+
+
+def test_downstream_failure_is_not_reported_as_a_bad_message(fake_sdk, capsys):
+    """pa.lib.ArrowInvalid 繼承自 ValueError：若回呼留在解析的 try 內，
+    聚合／寫檔／廣播的失敗會被當成「訊息壞掉」吞掉，畫面照常更新
+    而資料早已停止落檔。"""
+    import pyarrow as pa
+
+    def explode(_trade):
+        raise pa.lib.ArrowInvalid("Parquet magic bytes not found in footer")
+
+    feed = FugleFeed("k", ["2330"], explode, lambda b: None)
+    feed.handle_message(TRADE_EVENT)
+
+    err = capsys.readouterr().err
+    assert "Trade callback failed" in err
+    assert "ArrowInvalid" in err
+    assert "Unable to process message" not in err, "下游失敗不可被誤報為訊息解析失敗"
+
+
+def test_callback_failure_does_not_stop_the_feed(fake_sdk, capsys):
+    seen = []
+    calls = []
+
+    def flaky(trade):
+        calls.append(trade)
+        if len(calls) == 1:
+            raise RuntimeError("first one blows up")
+        seen.append(trade)
+
+    books = []
+
+    def bad_book(_book):
+        raise RuntimeError("book callback blows up")
+
+    feed = FugleFeed("k", ["2330"], flaky, bad_book)
+    feed.handle_message(TRADE_EVENT)                       # 第一筆炸掉
+    feed.handle_message(json.dumps({
+        "event": "data", "channel": "books",
+        "data": {"symbol": "2330", "bids": [], "asks": [], "time": 6},
+    }))                                                    # 五檔回呼也炸掉
+    feed.handle_message(json.dumps({**json.loads(TRADE_EVENT)}))
+
+    assert [t["serial"] for t in seen] == [10], "回呼失敗不得中斷行情迴圈"
+    err = capsys.readouterr().err
+    assert "Trade callback failed" in err
+    assert "Book callback failed" in err
+    assert books == []
+
+
+def test_trade_event_without_symbol_is_counted_as_dropped(fake_sdk, capsys):
+    """沒有 symbol 的事件（最可能是開盤集合競價）若被靜默丟棄，
+    auction_lots 全日為 0 卻沒有任何錯誤。"""
+    trades = []
+    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
+    payload = {"price": 2385, "size": 2024, "volume": 2024,
+               "time": 1785891605048734, "serial": 131115}
+    feed.handle_message(json.dumps(
+        {"event": "data", "channel": "trades", "data": payload}))
+
+    assert trades == []
+    assert feed.dropped_events["trades"] == 1
+    err = capsys.readouterr().err
+    assert "trades" in err and "symbol=None" in err
+    assert "serial" in err, "應附上鍵名清單以便診斷"
+    assert "2385" not in err, "不要印整個 payload"
+
+
+def test_repeated_drops_are_counted_but_printed_once(fake_sdk, capsys):
+    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    event = json.dumps({"event": "data", "channel": "trades",
+                        "data": {"price": 2385, "size": 1, "time": 1}})
+    for _ in range(3):
+        feed.handle_message(event)
+    assert feed.dropped_events["trades"] == 3
+    assert capsys.readouterr().err.count("Dropping") == 1
+
+
+def test_book_event_for_untracked_symbol_is_dropped_and_counted(fake_sdk):
+    books = []
+    feed = FugleFeed("k", ["2330"], lambda t: None, books.append)
+    feed.handle_message(json.dumps({
+        "event": "data", "channel": "books",
+        "data": {"symbol": "2454", "bids": [], "asks": [], "time": 7},
+    }))
+    assert books == []
+    assert feed.dropped_events["books"] == 1
+    assert feed.dropped_events["trades"] == 0
+
+
 def test_malformed_message_does_not_kill_the_feed(fake_sdk):
     trades = []
     feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)

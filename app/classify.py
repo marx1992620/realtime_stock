@@ -18,11 +18,19 @@ UNKNOWN = "unknown"  # 五檔中間；實測未發生，保留以免靜默歸錯
 def classify_side(trade: dict) -> str:
     """判定一筆成交的方向。
 
-    集合競價的成交事件不帶 bid/ask —— 那筆撮合本來就沒有最佳一檔可比，
-    買賣雙方同時成交，因此獨立成一類，不併入買或賣。
+    集合競價的成交事件「兩邊都不帶」bid/ask —— 那筆撮合本來就沒有最佳一檔
+    可比，買賣雙方同時成交，因此獨立成一類，不併入買或賣。
+
+    只缺一邊是另一回事：漲停時賣方佇列為空、跌停時買方佇列為空，若來源省略
+    該欄位而非送 0，把它算成集合競價會讓漲跌停日的成交全部灌進 auction_lots，
+    在最需要準確的那幾天靜默失真。缺一邊就無從判定主動方，歸為 UNKNOWN。
     """
-    if "bid" not in trade or "ask" not in trade:
+    has_bid = "bid" in trade
+    has_ask = "ask" in trade
+    if not has_bid and not has_ask:
         return AUCTION
+    if not has_bid or not has_ask:
+        return UNKNOWN
     price = trade["price"]
     if price >= trade["ask"]:
         return BUY

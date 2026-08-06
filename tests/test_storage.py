@@ -1,8 +1,9 @@
 import pyarrow.parquet as pq
 
-from app.storage import ParquetTradeWriter, output_path
+from app.storage import TRADE_SCHEMA, ParquetTradeWriter, output_path
 
 
+# 記憶體紀錄仍帶 is_large（大單階梯靠它算），落檔時必須被濾掉。
 RECORD = {
     "symbol": "2330", "serial": 13674373, "time": 1785902209312276,
     "price": 2405.0, "lots": 2, "shares": 2000, "side": "buy",
@@ -64,6 +65,77 @@ def test_close_without_records_creates_no_file(tmp_path):
     path = tmp_path / "trades.parquet"
     ParquetTradeWriter(path).close()
     assert not path.exists()
+
+
+def test_schema_drops_is_large(tmp_path):
+    """門檻可即時調整，已落檔的旗標會停留在寫入當下的門檻上 —— 同一個檔案
+    可能混了多個門檻且無處可查。value_twd 已落檔，任何門檻都能事後算出。"""
+    assert "is_large" not in TRADE_SCHEMA.names
+    assert TRADE_SCHEMA.names == ["symbol", "serial", "time", "price", "lots",
+                                  "shares", "side", "value_twd"]
+
+    path = tmp_path / "trades.parquet"
+    with ParquetTradeWriter(path) as writer:
+        writer.append(RECORD)                 # 多出來的鍵必須被忽略而非拋錯
+    table = pq.read_table(path)
+    assert "is_large" not in table.column_names
+    assert table.to_pylist()[0]["value_twd"] == 4_810_000.0
+
+
+def test_append_after_close_never_truncates_the_finished_file(tmp_path):
+    """行情執行緒是 daemon，close() 之後仍可能送進成交。舊行為會在湊滿批次時
+    以同一路徑重開 ParquetWriter，把已經寫完的檔案截斷成讀不出來的殘骸。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path, batch_size=2)
+    writer.append(RECORD)
+    writer.append({**RECORD, "serial": 2})
+    writer.close()
+    good_size = path.stat().st_size
+
+    for serial in range(10, 15):                      # 關檔後才進來的五筆
+        writer.append({**RECORD, "serial": serial})
+
+    # 先驗檔案本身：修正前這裡讀到的是 ArrowInvalid（footer 沒有 magic bytes）
+    assert path.stat().st_size == good_size, "關檔後的 append 不得再動檔案"
+    assert pq.read_table(path).num_rows == 2
+    assert writer.dropped_after_close == 5
+
+
+def test_records_dropped_after_close_are_announced(tmp_path, capsys):
+    """遺失必須是看得見的：正式流程只會 close 一次，所以第一筆丟棄要當下就說，
+    再次關檔時報總數。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path, batch_size=100)
+    writer.append(RECORD)
+    writer.close()
+    capsys.readouterr()
+
+    writer.append(RECORD)
+    assert "after close" in capsys.readouterr().err
+    writer.append(RECORD)
+    assert capsys.readouterr().err == "", "之後只累加，不重複洗版"
+
+    writer.close()
+    assert "2" in capsys.readouterr().err
+
+
+def test_failed_flush_loses_only_that_batch(tmp_path, capsys):
+    """毒化的緩衝區若留著，之後每次 flush 都會再拋一次，整日不再落檔。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path, batch_size=1)
+    writer.append(RECORD)                              # 開檔，正常寫入
+
+    original = writer._writer.write_table
+    writer._writer.write_table = lambda table: (_ for _ in ()).throw(
+        RuntimeError("disk full"))
+    writer.append({**RECORD, "serial": 2})             # 不得拋出
+    assert writer._buffer == [], "寫入失敗的批次必須被丟掉，不可留在緩衝區"
+    assert "disk full" in capsys.readouterr().err
+
+    writer._writer.write_table = original
+    writer.append({**RECORD, "serial": 3})             # 之後仍能繼續落檔
+    writer.close()
+    assert [r["serial"] for r in pq.read_table(path).to_pylist()] == [13674373, 3]
 
 
 def test_output_path_layout(tmp_path):

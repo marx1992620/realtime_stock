@@ -46,6 +46,21 @@ def test_trade_without_quote_is_auction():
     assert classify.classify_side(TRADE_AUCTION) == classify.AUCTION
 
 
+def test_only_bid_present_is_unknown_not_auction():
+    """漲停時賣方佇列可能為空 —— 少了 ask 不代表這是集合競價，
+    誤判會讓漲停日的成交全部灌進 auction_lots。"""
+    limit_up = {"symbol": "2330", "price": 2640, "size": 5, "bid": 2640,
+                "time": 1785902209312276, "serial": 1}
+    assert classify.classify_side(limit_up) == classify.UNKNOWN
+
+
+def test_only_ask_present_is_unknown_not_auction():
+    """跌停時買方佇列可能為空 —— 同上。"""
+    limit_down = {"symbol": "2330", "price": 2160, "size": 5, "ask": 2160,
+                  "time": 1785902209312276, "serial": 2}
+    assert classify.classify_side(limit_down) == classify.UNKNOWN
+
+
 def test_mid_spread_is_unknown_not_silently_merged():
     """連續交易時段實測 0 筆，但若出現不可混入買/賣或集合競價。"""
     mid = {"price": 2402, "size": 1, "bid": 2400, "ask": 2405}
