@@ -2102,6 +2102,144 @@ git commit -m "feat: add parquet to csv export command"
 
 ---
 
+## Task 10: 最終審查修正與逐檔大單門檻
+
+> 排在 Task 9 之前執行。整支分支的最終審查找出七項只有在組裝後才看得見的缺陷；
+> 同時使用者提出逐檔門檻的需求。兩者動到同一條門檻程式路徑，故合為一輪。
+
+**Files:**
+- Modify: `app/storage.py`（A、B）
+- Modify: `app/feed.py`（C、E）
+- Modify: `app/classify.py`（D）
+- Modify: `app/web.py`（F、H）
+- Modify: `app/__main__.py`（H）
+- Modify: `app/static/index.html`（G、H）
+- Modify: `tests/test_storage.py`、`tests/test_export.py`、`tests/test_main.py`、`tests/test_classify.py`、`tests/test_web.py`、`tests/test_feed.py`
+
+**Interfaces:**
+- Consumes: 全部既有模組
+- Produces（相對既有介面的變更）:
+  - `TRADE_SCHEMA` 移除 `is_large` 欄位（**記憶體紀錄仍保留該鍵**）
+  - `ParquetTradeWriter.close()` 之後 `append()` 為 no-op 並計數；`dropped_after_close` 屬性
+  - `MarketState(symbols, large_order_twd: float | dict[str, float])`
+  - `MarketState.thresholds -> dict[str, float]`（取代單一 `large_order_twd` 屬性）
+  - `MarketState.set_threshold(threshold_twd: float, symbol: str | None = None)`
+  - `POST /api/threshold` body 新增選填 `symbol`
+  - `GET /api/symbols` 回傳 `{"symbols": [...], "thresholds": {symbol: float}}`
+
+### A. Parquet 不再落 `is_large`
+
+`is_large` 由門檻決定，而門檻可即時調整，因此已落檔的列會保留舊旗標——同一個檔案可能混了多個門檻且無處可查。`value_twd` 已落檔，任何門檻都能事後算出，這個欄位不提供額外資訊，只提供錯誤的確定感。
+
+- `app/storage.py`：`TRADE_SCHEMA` 移除 `("is_large", pa.bool_())`。其餘八欄與順序不變。
+- **不要**改 `app/aggregator.py`：記憶體紀錄仍需 `is_large`，大單階梯與大單明細靠它計算，畫面呈現的大單數量與價格不受影響。`ParquetTradeWriter.append` 本來就以 `TRADE_SCHEMA.names` 過濾傳入的 dict，所以多出來的鍵會自動被忽略。
+- `app/export.py` 的 `CSV_FIELDS` 由 `TRADE_SCHEMA.names` 衍生，自動跟隨，無需修改。
+- 更新測試中對 `is_large` 欄位的斷言：`tests/test_storage.py`、`tests/test_export.py`、`tests/test_main.py`。
+
+### B. `ParquetTradeWriter` 生命週期防護
+
+行情執行緒是 daemon，`pipeline.close()` 在 `finally` 執行時它仍可能送進成交。關檔後的 `append` 若湊滿 `batch_size` 會重開 `pq.ParquetWriter` 於同一路徑並**截斷已完成的檔案**（實測：2,605 bytes 的有效檔變成 773 bytes、`ArrowInvalid: Parquet magic bytes not found in footer`，整日資料無法讀取）。
+
+- 新增 `self._closed = False`；`close()` 設為 `True`。
+- `append()` 在 `self._closed` 為真時直接 return 並 `self.dropped_after_close += 1`，**不得**拋例外（會從行情執行緒逸出），也**不得**緩衝。
+- `close()` 若 `dropped_after_close > 0`，印一行到 stderr 說明丟棄筆數，讓遺失是可見的。
+- `flush()` 的 `write_table` 以 `try/finally` 包住，`finally` 中 `self._buffer.clear()`：一批資料寫入失敗只損失該批，不會讓毒化的緩衝區在之後每次 flush 重複拋出、導致整日不再落檔。失敗時印一行到 stderr。
+
+### C. 行情層的錯誤邊界不得包住下游
+
+`app/feed.py` 目前把 `self.on_trade(data)` 放在 try 之內，該 try 的 except 捕捉 `KeyError, TypeError, ValueError, AttributeError`。`pa.lib.ArrowInvalid` 繼承自 `ValueError`，因此聚合、寫檔、廣播的任何失敗都會被吞掉並印成「Unable to process message」，畫面照常更新而資料早已停止落檔。
+
+- 訊息解析與路由判斷留在原本的 try 內。
+- 回呼（`self.on_trade` / `self.on_book`）移到該 try **之外**，各自以獨立的 `try/except Exception` 包住，訊息明確區分，例如
+  `print(f"Trade callback failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)`。
+- 回呼失敗不可中斷行情迴圈。
+
+### D. 單邊報價不得歸為集合競價
+
+`classify_side` 目前在 `bid` 或 `ask` **任一**缺失時回傳 `AUCTION`。漲停時賣方佇列為空、跌停時買方佇列為空，若 Fugle 省略該欄位而非送 0，所有漲跌停成交都會被算進 `auction_lots`，買賣統計在最需要準確的那幾天靜默失真。
+
+- `AUCTION` 僅在 `bid` 與 `ask` **兩者皆缺**時回傳。
+- 恰好缺一邊時回傳 `UNKNOWN`（該常數存在的理由正是「不可混入買/賣或集合競價」）。
+- `tests/test_classify.py` 新增兩個案例：只有 `bid`、只有 `ask`，皆須為 `UNKNOWN`。
+
+### E. 被丟棄的行情事件必須可見
+
+`app/feed.py` 以 `data.get("symbol") not in self.symbols` 過濾。若某類事件（最可能是開盤集合競價）不帶 `symbol`，會被整批靜默丟棄，`auction_lots` 全日為 0 卻沒有任何錯誤——看起來就像「今天沒有集合競價」。
+
+- 新增 `self.dropped_events: collections.Counter`，以被丟棄事件的 `channel` 為鍵計數。
+- 首次丟棄某個 channel 時印一行 stderr，並附上該事件的鍵名清單（**不要印整個 payload**），例如
+  `print(f"Dropping {channel} event with symbol={data.get('symbol')!r}; keys={sorted(data)}", ...)`；之後只累加計數不再重複印。
+- `tests/test_feed.py` 新增：缺 `symbol` 的 trades 事件被丟棄且計數為 1；books 頻道的未追蹤代碼也被丟棄（補上既有的覆蓋缺口）。
+
+### F. 事件迴圈上不得持鎖
+
+`app/web.py` 的 `async def stream` 直接呼叫 `state.snapshot(...)`，該方法取 `threading.Lock`。門檻重算持鎖（實測單檔 5 萬筆 27 ms），晚盤多檔時會阻塞整個事件迴圈——所有連線、所有 HTTP 請求一起停擺。
+
+- `stream` 內所有 `state.snapshot(...)` / `state.snapshot_all(...)` 改為
+  `await asyncio.to_thread(state.snapshot, name)` 形式，讓等鎖發生在工作執行緒上。
+- 同步 `def` 路由（`/api/snapshot/{symbol}`、`/api/threshold`）本來就跑在 FastAPI 的工作執行緒，維持不變。
+
+### G. 畫面重繪不得重置捲動位置
+
+`app/static/index.html` 每則訊息都整塊替換 `#panels.innerHTML`，五檔每秒數次更新，配合 0.2 秒合併即每秒重繪最多 5 次，四個 `.scroll` 容器的捲動位置全部歸零。全日價位階梯與 200 列明細正是使用者要捲的內容，盤中等於無法閱讀。
+
+- `render()` 重繪前先記下每個 `.scroll` 容器的 `scrollTop`（以其所在 `section` 的索引為鍵），重繪後還原。
+- 不需改成增量渲染；保留捲動位置即可解決。
+
+### H. 逐檔大單門檻
+
+單一門檻在高低價股之間沒有意義：門檻 100 萬時 2330 一張 240 萬（每筆都是大單），2317 一張 25.8 萬（需 4 張）。
+
+**`app/__main__.py`** —— `--large-order` 同時接受單一數字與逐檔指定，可混用：
+
+```
+--large-order 1000000                      全部套用 100 萬
+--large-order 2330=5000000,2317=800000     逐檔指定
+--large-order 1000000,2330=5000000         預設 100 萬，2330 覆寫為 500 萬
+```
+
+解析規則：以逗號切分；含 `=` 的視為 `symbol=amount`，否則為預設值（只允許出現一次，重複出現視為錯誤）。金額一律須為正數，否則 `argparse.ArgumentTypeError`。若某個 `--symbols` 的代碼既無覆寫也無預設值，報錯並指名該代碼。逐檔指定中出現不在 `--symbols` 內的代碼，同樣報錯。
+
+**`app/web.py`** ——
+- `MarketState(symbols, large_order_twd: float | dict[str, float])`：傳入純數字表示全部相同（既有測試不受影響）；傳入 dict 則須涵蓋每一個 symbol，缺漏即 `KeyError`。
+- 以 `self.thresholds -> dict[str, float]` 取代單一的 `self.large_order_twd` 屬性（回傳複本，避免外部改動內部狀態）。
+- `set_threshold(threshold_twd, symbol=None)`：`symbol` 為 `None` 時套用全部；指定時只重算該檔（未追蹤代碼 `raise KeyError`，路由轉 404）。
+- `POST /api/threshold` body 新增選填 `symbol`；回傳 `{"thresholds": {...}}`。只改一檔時只 `publish` 該檔。
+- `GET /api/symbols` 回傳 `{"symbols": [...], "thresholds": {symbol: float}}`。
+- ws `init` 訊息以 `thresholds` 取代 `large_order_twd`（每檔快照本來就各自帶自己的 `large_order_twd`，UI 主要讀那個）。
+
+**`app/static/index.html`** ——
+- 門檻輸入框與【套用】按鈕從頁首移入各股票面板，值取自該檔快照的 `large_order_twd`，送出時帶上該檔 `symbol`。
+- 頁首保留分頁與連線狀態。
+- 大單階梯標題已經在顯示該檔的 `large_order_twd`，維持不變。
+
+- [ ] **Step 1: 先寫失敗的測試**
+
+依上述 A–H 各節在對應測試檔補上案例，並執行確認失敗：
+
+```bash
+/Users/chia-chingcho/.local/share/virtualenvs/tw_stock_realtime-JRdNzDPE/bin/python -m pytest -q
+```
+
+- [ ] **Step 2: 依 A–H 順序實作**
+
+由下而上：`classify.py`(D) → `storage.py`(A,B) → `feed.py`(C,E) → `web.py`(F,H) → `__main__.py`(H) → `index.html`(G,H)。
+
+- [ ] **Step 3: 全套件通過且輸出乾淨**
+
+```bash
+/Users/chia-chingcho/.local/share/virtualenvs/tw_stock_realtime-JRdNzDPE/bin/python -m pytest -q
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "fix: address whole-branch review and add per-symbol large-order thresholds"
+```
+
+---
+
 ## Task 9: 實機驗證與文件
 
 **Files:**
