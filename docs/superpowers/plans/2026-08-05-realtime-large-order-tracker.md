@@ -1017,7 +1017,10 @@ class FugleFeed:
                 self.on_trade(data)
             elif channel == "books":
                 self.on_book(data)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as error:
+            # AttributeError matters: valid JSON that is not an object (a bare
+            # array, or an event whose "data" is not a dict) reaches .get() and
+            # would otherwise kill the stream.
             print(f"Unable to process message: {error}", file=sys.stderr, flush=True)
 
     # -- lifecycle -------------------------------------------------------
