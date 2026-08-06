@@ -131,7 +131,11 @@ def test_untracked_symbol_is_ignored(fake_sdk):
 def test_malformed_message_does_not_kill_the_feed(fake_sdk):
     trades = []
     feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
-    feed.handle_message("not json")                      # 不可拋出
+    feed.handle_message("not json")                       # JSONDecodeError
+    feed.handle_message(json.dumps([1, 2, 3]))             # top level not an object
+    feed.handle_message(json.dumps({
+        "event": "data", "channel": "trades", "data": [1, 2, 3],
+    }))                                                    # "data" not an object
     feed.handle_message(json.dumps({
         "event": "data", "channel": "trades",
         "data": {"symbol": "2330", "price": 2405, "size": 1, "bid": 2400,
