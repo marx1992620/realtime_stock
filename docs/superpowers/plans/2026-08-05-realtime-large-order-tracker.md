@@ -1080,12 +1080,25 @@ git commit -m "feat: add single-connection multi-symbol Fugle feed with auth-gat
     - `subscribe() -> asyncio.Queue`
     - `unsubscribe(queue) -> None`
   - `class MarketState(symbols: list[str], large_order_twd: float)`
-    - `aggregator(symbol) -> SymbolAggregator`
-    - `snapshot(symbol) -> dict`
-    - `snapshot_all() -> dict`
-    - `set_threshold(threshold_twd: float) -> None`
+    - `aggregator(symbol) -> SymbolAggregator`（未加鎖，僅供測試與唯讀檢視）
+    - `record_trade(trade: dict) -> dict | None` — **加鎖**的成交寫入口
+    - `record_book(book: dict) -> None` — **加鎖**的五檔寫入口
+    - `snapshot(symbol) -> dict` / `snapshot_all() -> dict` — **加鎖**
+    - `set_threshold(threshold_twd: float) -> None` — **加鎖**
   - `create_app(state: MarketState, broadcaster: Broadcaster) -> fastapi.FastAPI`
   - 路由：`GET /`、`GET /api/symbols`、`GET /api/snapshot/{symbol}`、`POST /api/threshold`、`WS /ws`
+
+> **為何需要鎖**：`POST /api/threshold` 是同步 `def` 路由，FastAPI 會丟到工作執行緒執行，因此
+> `set_threshold` 會與 Fugle SDK 執行緒的 `record_trade` 同時改動同一個聚合器。`set_threshold`
+> 重建 `_large_levels` 時若被切斷，切斷後進來的成交會被計入兩次（`add_trade` 自己一次、重算
+> 迴圈走到它又一次），大單階梯**永久偏高**直到下次改門檻，且不拋任何例外。
+>
+> 實測：分水嶺是 CPython 的 GIL 切換間隔 5 ms。重算迴圈短於它時通常在單一時間片內跑完，
+> 不會出錯（10,000 筆 → 3.7 ms，4 次測試 0 錯）；超過就必然被切斷（50,000 筆 → 26.9 ms，
+> 4 次全錯，偏差 +4 張；200,000 筆 → 113.4 ms，偏差 +14 張）。也就是**當日成交越多越容易錯**。
+>
+> 鎖的代價實測趨近於零：`add_trade` 持鎖 2.2 µs，每秒 50 筆下佔用率 0.011%；`snapshot`
+> 0.35 ms；`set_threshold` 4.4 ms 且只在使用者按【套用】時發生一次。
 
 - [ ] **Step 1: 寫失敗的測試**
 
@@ -1186,6 +1199,90 @@ def test_broadcaster_publish_is_safe_from_another_thread():
 def test_broadcaster_drops_symbols_when_no_loop_bound():
     """尚未綁定事件迴圈時 publish 不得拋例外（行情可能早於 web 啟動）。"""
     Broadcaster().publish("2330")
+
+
+def test_broadcaster_drops_symbols_after_loop_closed():
+    """關機時迴圈已關、SDK 執行緒仍在送 —— publish 不得從回呼執行緒拋出。"""
+    broadcaster = Broadcaster()
+
+    async def bind():
+        broadcaster.bind_loop(asyncio.get_running_loop())
+        broadcaster.subscribe()
+
+    asyncio.run(bind())          # asyncio.run 結束時會關閉該迴圈
+    broadcaster.publish("2330")  # 不得拋 RuntimeError
+
+
+def test_record_trade_routes_to_the_right_aggregator():
+    state, _ = build()
+    record = state.record_trade(AT_ASK)
+    assert record["symbol"] == "2330"
+    assert state.snapshot("2330")["ladder"][0]["buy_lots"] == 2
+    assert state.snapshot("2317")["trade_count"] == 0
+
+
+def test_record_trade_ignores_untracked_symbol():
+    state, _ = build()
+    assert state.record_trade({**AT_ASK, "symbol": "9999"}) is None
+
+
+def test_record_trade_ignores_duplicate_serial():
+    state, _ = build()
+    assert state.record_trade(AT_ASK) is not None
+    assert state.record_trade(AT_ASK) is None
+
+
+def test_record_book_reports_whether_symbol_is_tracked():
+    state, _ = build()
+    assert state.record_book(BOOK) is True
+    assert state.record_book({**BOOK, "symbol": "9999"}) is False
+    assert state.snapshot("2330")["bids"][0]["price"] == 2390
+
+
+def test_threshold_change_is_correct_under_concurrent_ingest():
+    """set_threshold 與行情寫入同時發生時，大單階梯不得重複計數。
+
+    未加鎖時這會失敗：set_threshold 重建 _large_levels 的迴圈一旦超過 CPython
+    的 GIL 切換間隔（5 ms）就會被切斷，切斷後進來的成交會被算兩次 —— 由
+    add_trade 自己一次，再由重算迴圈走到它一次。歷史筆數必須夠多才會跨過
+    那條線（實測 10,000 筆 3.7 ms 不會錯，50,000 筆 26.9 ms 必錯）。
+    """
+    import threading
+
+    state = MarketState(["2330"], large_order_twd=1_000_000)
+    for i in range(50_000):                       # 內盤(賣) @2400，重算需 ~27 ms
+        state.record_trade({"symbol": "2330", "price": 2400, "size": 1, "bid": 2400,
+                            "ask": 2405, "time": i, "serial": i})
+
+    stop = threading.Event()
+
+    def ingest():                                  # 模擬 SDK 行情執行緒：外盤(買) @2405
+        serial = 10 ** 8
+        while not stop.is_set():
+            state.record_trade({"symbol": "2330", "price": 2405, "size": 1, "bid": 2400,
+                                "ask": 2405, "time": serial, "serial": serial})
+            serial += 1
+
+    thread = threading.Thread(target=ingest)
+    thread.start()
+    try:
+        state.set_threshold(1_000_000)
+    finally:
+        stop.set()
+        thread.join()
+
+    snapshot = state.snapshot("2330")
+    fields = {"buy": "buy_lots", "sell": "sell_lots",
+              "auction": "auction_lots", "unknown": "unknown_lots"}
+    expected: dict = {}
+    for trade in state.aggregator("2330").trades:
+        if trade["value_twd"] >= snapshot["large_order_twd"]:
+            key = (trade["price"], fields[trade["side"]])
+            expected[key] = expected.get(key, 0) + trade["lots"]
+    actual = {(row["price"], field): row[field]
+              for row in snapshot["large_ladder"]
+              for field in fields.values() if row[field]}
+    assert actual == expected
 ```
 
 - [ ] **Step 2: 執行測試確認失敗**
@@ -1210,6 +1307,7 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'app.web'`
 from __future__ import annotations
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -1249,37 +1347,78 @@ class Broadcaster:
         self._queues.discard(queue)
 
     def publish(self, symbol: str) -> None:
-        """可從任何執行緒呼叫。web 尚未啟動時安靜丟棄。"""
+        """可從任何執行緒呼叫。
+
+        兩端都要保護：web 尚未啟動時還沒有迴圈可綁（行情可能早於 uvicorn 就緒），
+        關機時迴圈已關閉但 SDK 執行緒仍在送訊息。兩種情況都安靜丟棄，
+        不可讓例外從 SDK 的回呼執行緒逸出。
+        """
         loop = self._loop
-        if loop is None:
+        if loop is None or loop.is_closed():
             return
         for queue in list(self._queues):
-            loop.call_soon_threadsafe(queue.put_nowait, symbol)
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, symbol)
+            except RuntimeError:
+                # 迴圈在上面的檢查之後才關閉 —— 這個競從無法用檢查消除
+                return
 
 
 class MarketState:
+    """所有聚合器狀態的持有者，並負責跨執行緒互斥。
+
+    兩個執行緒會寫入：Fugle SDK 的行情執行緒（record_trade / record_book），
+    以及 FastAPI 跑同步路由的工作執行緒（set_threshold）。所有寫入與讀取都
+    走同一把鎖，否則重算大單階梯時被切斷會造成永久性的重複計數。
+    """
+
     def __init__(self, symbols: list[str], large_order_twd: float) -> None:
         self.symbols = list(symbols)
         self.large_order_twd = large_order_twd
+        self._lock = threading.Lock()
         self._aggregators = {
             s: SymbolAggregator(s, large_order_twd) for s in self.symbols
         }
 
     def aggregator(self, symbol: str) -> SymbolAggregator:
+        """未加鎖的直接存取，僅供測試與單執行緒檢視。
+        正式的寫入路徑一律用 record_trade / record_book。"""
         if symbol not in self._aggregators:
             raise KeyError(symbol)
         return self._aggregators[symbol]
 
-    def snapshot(self, symbol: str) -> dict:
-        return self.aggregator(symbol).snapshot()
+    # -- 寫入（加鎖）------------------------------------------------------
+    def record_trade(self, trade: dict) -> dict | None:
+        """記錄一筆成交，回傳正規化紀錄；重複 serial 或未追蹤代碼回傳 None。"""
+        symbol = trade.get("symbol")
+        with self._lock:
+            aggregator = self._aggregators.get(symbol)
+            return aggregator.add_trade(trade) if aggregator is not None else None
 
-    def snapshot_all(self) -> dict:
-        return {s: a.snapshot() for s, a in self._aggregators.items()}
+    def record_book(self, book: dict) -> bool:
+        """更新五檔快照；未追蹤代碼回傳 False。"""
+        symbol = book.get("symbol")
+        with self._lock:
+            aggregator = self._aggregators.get(symbol)
+            if aggregator is None:
+                return False
+            aggregator.update_book(book)
+            return True
 
     def set_threshold(self, threshold_twd: float) -> None:
-        self.large_order_twd = threshold_twd
-        for aggregator in self._aggregators.values():
-            aggregator.set_threshold(threshold_twd)
+        with self._lock:
+            self.large_order_twd = threshold_twd
+            for aggregator in self._aggregators.values():
+                aggregator.set_threshold(threshold_twd)
+
+    # -- 讀取（加鎖）------------------------------------------------------
+    def snapshot(self, symbol: str) -> dict:
+        with self._lock:
+            return self.aggregator(symbol).snapshot()
+
+    def snapshot_all(self) -> dict:
+        with self._lock:
+            return {s: a.snapshot() for s, a in self._aggregators.items()}
 
 
 def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
@@ -1345,6 +1484,34 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
 mkdir -p app/static
 printf '<!doctype html><meta charset="utf-8"><title>台股即時大單追蹤</title>\n' > app/static/index.html
 ```
+
+- [ ] **Step 4b: 安裝並宣告 WebSocket 傳輸層**
+
+純 `uvicorn` **不含任何 WebSocket 實作**（`uvicorn.Config(..., ws="auto").load()` 會得到
+`ws_protocol_class = None`），瀏覽器的升級請求會被回以 "Unsupported upgrade request"，
+`/ws` 完全無法運作。測試不會察覺，因為 Starlette 的 `TestClient` 是在行程內用 ASGI 實作
+WebSocket，根本不經過 uvicorn 的傳輸層。
+
+```bash
+/Users/chia-chingcho/.local/share/virtualenvs/tw_stock_realtime-JRdNzDPE/bin/python \
+  -m pip install websockets
+```
+
+`requirements.txt` 加一行 `websockets`；`Pipfile` 的 `[packages]` 加 `websockets = "*"`。
+
+- [ ] **Step 4c: 讓測試輸出恢復乾淨**
+
+`fastapi.testclient` 在 starlette 1.3.1 + httpx 0.28.1 下會發出一個
+`StarletteDeprecationWarning`。它不是本專案的程式碼問題，但輸出必須乾淨，
+以免真正的警告被淹沒。在專案根目錄建立 `pytest.ini`：
+
+```ini
+[pytest]
+filterwarnings =
+    ignore::starlette.exceptions.StarletteDeprecationWarning
+```
+
+窄範圍忽略單一已知警告，不可用 `ignore::DeprecationWarning` 之類的全面關閉。
 
 - [ ] **Step 5: 執行測試確認通過**
 
@@ -1667,26 +1834,19 @@ class Pipeline:
         self.writers = writers
 
     def handle_trade(self, trade: dict) -> None:
-        symbol = trade.get("symbol")
-        try:
-            aggregator = self.state.aggregator(symbol)
-        except KeyError:
+        # 走 MarketState 的加鎖寫入口：這個回呼在 Fugle SDK 的執行緒上，
+        # 而 POST /api/threshold 會在 FastAPI 的工作執行緒上改同一份狀態。
+        record = self.state.record_trade(trade)
+        if record is None:            # 未追蹤代碼，或重複 serial
             return
-        record = aggregator.add_trade(trade)
-        if record is None:            # 重複 serial，不重複寫檔
-            return
-        writer = self.writers.get(symbol)
+        writer = self.writers.get(record["symbol"])
         if writer is not None:
             writer.append(record)
-        self.broadcaster.publish(symbol)
+        self.broadcaster.publish(record["symbol"])
 
     def handle_book(self, book: dict) -> None:
-        symbol = book.get("symbol")
-        try:
-            self.state.aggregator(symbol).update_book(book)
-        except KeyError:
-            return
-        self.broadcaster.publish(symbol)
+        if self.state.record_book(book):
+            self.broadcaster.publish(book["symbol"])
 
     def close(self) -> None:
         for writer in self.writers.values():
