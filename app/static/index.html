@@ -47,14 +47,19 @@ function sideLabel(side) {
 
 function ladderTable(rows, title) {
   if (!rows.length) return `<h2>${title}</h2><p class="muted">尚無資料</p>`;
+  // 未分類欄只在真的有值時才出現 —— 連續交易時段實測為 0 筆，
+  // 常態顯示一整欄破折號只會佔版面。
+  const hasUnknown = rows.some(r => r.unknown_lots);
   const body = rows.map(r => `<tr class="${r.auction_lots ? "auction" : ""}">
       <td>${r.price}</td>
       <td class="buy">${fmt(r.buy_lots)}</td>
       <td class="sell">${fmt(r.sell_lots)}</td>
-      ${r.auction_lots ? `<td>${fmt(r.auction_lots)}</td>` : "<td>—</td>"}
+      <td>${r.auction_lots ? fmt(r.auction_lots) : "—"}</td>
+      ${hasUnknown ? `<td>${r.unknown_lots ? fmt(r.unknown_lots) : "—"}</td>` : ""}
     </tr>`).join("");
   return `<h2>${title}</h2><div class="scroll"><table>
-    <tr><th>價格</th><th>買(外盤)</th><th>賣(內盤)</th><th>集合競價</th></tr>
+    <tr><th>價格</th><th>買(外盤)</th><th>賣(內盤)</th><th>集合競價</th>${
+      hasUnknown ? "<th>未分類</th>" : ""}</tr>
     ${body}</table></div>`;
 }
 
@@ -113,7 +118,10 @@ function renderTabs() {
     el.onclick = () => { state.active = el.dataset.symbol; renderTabs(); render(); });
 }
 
-const ws = new WebSocket(`ws://${location.host}/ws`);
+// 由頁面協定推導 ws/wss：寫死 ws:// 時，只要頁面經 HTTPS 提供（例如放在
+// TLS 反向代理後），瀏覽器會以混合內容為由封鎖連線，整個畫面卡在「連線中…」。
+const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
+const ws = new WebSocket(`${wsScheme}//${location.host}/ws`);
 ws.onopen = () => document.getElementById("status").textContent = "已連線";
 ws.onclose = () => document.getElementById("status").textContent = "已斷線，請重整頁面";
 ws.onmessage = event => {
