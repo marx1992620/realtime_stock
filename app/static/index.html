@@ -1,1 +1,143 @@
-<!doctype html><meta charset="utf-8"><title>台股即時大單追蹤</title>
+<!doctype html>
+<meta charset="utf-8">
+<title>台股即時大單追蹤</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 -apple-system, "PingFang TC", sans-serif; margin: 1rem; }
+  header { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  .tabs { display: flex; gap: .5rem; }
+  .tab { padding: .3rem .8rem; border: 1px solid #8884; border-radius: 4px; cursor: pointer; }
+  .tab.active { background: #8883; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-top: 1rem; }
+  section { border: 1px solid #8884; border-radius: 6px; padding: .6rem; }
+  h2 { font-size: 1rem; margin: 0 0 .5rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: .2rem .4rem; text-align: right; border-bottom: 1px solid #8882; }
+  th:first-child, td:first-child { text-align: left; }
+  .buy { color: #c0392b; }        /* 外盤，紅 */
+  .sell { color: #27ae60; }       /* 內盤，綠 */
+  .auction { background: #8882; } /* 集合競價 */
+  .scroll { max-height: 320px; overflow-y: auto; }
+  .price { font-size: 1.6rem; font-weight: 700; }
+  .muted { opacity: .65; font-size: .85em; }
+</style>
+
+<header>
+  <strong>台股即時大單追蹤</strong>
+  <div class="tabs" id="tabs"></div>
+  <label>大單門檻
+    <input id="threshold" type="number" min="1" step="100000" style="width: 9rem">
+    元
+  </label>
+  <button id="apply">套用</button>
+  <span id="status" class="muted">連線中…</span>
+</header>
+
+<div class="grid" id="panels"></div>
+
+<script>
+const state = { snapshots: {}, symbols: [], active: null };
+const fmt = n => (n ?? 0).toLocaleString("zh-TW");
+const money = n => (n ?? 0).toLocaleString("zh-TW", { maximumFractionDigits: 0 });
+const clock = us => us ? new Date(us / 1000).toLocaleTimeString("zh-TW", { hour12: false }) : "—";
+
+function sideLabel(side) {
+  return { buy: "買", sell: "賣", auction: "競價", unknown: "?" }[side] ?? side;
+}
+
+function ladderTable(rows, title) {
+  if (!rows.length) return `<h2>${title}</h2><p class="muted">尚無資料</p>`;
+  const body = rows.map(r => `<tr class="${r.auction_lots ? "auction" : ""}">
+      <td>${r.price}</td>
+      <td class="buy">${fmt(r.buy_lots)}</td>
+      <td class="sell">${fmt(r.sell_lots)}</td>
+      ${r.auction_lots ? `<td>${fmt(r.auction_lots)}</td>` : "<td>—</td>"}
+    </tr>`).join("");
+  return `<h2>${title}</h2><div class="scroll"><table>
+    <tr><th>價格</th><th>買(外盤)</th><th>賣(內盤)</th><th>集合競價</th></tr>
+    ${body}</table></div>`;
+}
+
+function tradeTable(rows, title) {
+  if (!rows.length) return `<h2>${title}</h2><p class="muted">尚無資料</p>`;
+  const body = rows.map(t => `<tr>
+      <td>${clock(t.time)}</td>
+      <td>${t.price}</td>
+      <td class="${t.side}">${sideLabel(t.side)}</td>
+      <td>${fmt(t.lots)}</td>
+      <td>${money(t.value_twd)}</td>
+    </tr>`).join("");
+  return `<h2>${title}</h2><div class="scroll"><table>
+    <tr><th>時間</th><th>價格</th><th>別</th><th>張數</th><th>金額</th></tr>
+    ${body}</table></div>`;
+}
+
+function bookTable(snap) {
+  const rows = [];
+  for (let i = snap.asks.length - 1; i >= 0; i--) {
+    rows.push(`<tr><td class="sell">賣${i + 1}</td><td>${snap.asks[i].price}</td><td>${fmt(snap.asks[i].size)}</td></tr>`);
+  }
+  snap.bids.forEach((b, i) => {
+    rows.push(`<tr><td class="buy">買${i + 1}</td><td>${b.price}</td><td>${fmt(b.size)}</td></tr>`);
+  });
+  return `<h2>五檔 <span class="muted">${clock(snap.book_time)}</span></h2>
+    <table><tr><th>檔位</th><th>價格</th><th>張數</th></tr>${rows.join("")}</table>`;
+}
+
+function render() {
+  const snap = state.snapshots[state.active];
+  if (!snap) return;
+  document.getElementById("panels").innerHTML = `
+    <section>
+      <h2>${snap.symbol}</h2>
+      <div class="price">${snap.last_price ?? "—"}</div>
+      <div class="muted">最新成交 ${clock(snap.last_trade_time)}｜共 ${fmt(snap.trade_count)} 筆</div>
+      <table style="margin-top:.5rem">
+        <tr><th>買(外盤)</th><td class="buy">${fmt(snap.totals.buy_lots)} 張</td></tr>
+        <tr><th>賣(內盤)</th><td class="sell">${fmt(snap.totals.sell_lots)} 張</td></tr>
+        <tr><th>集合競價</th><td>${fmt(snap.totals.auction_lots)} 張</td></tr>
+        ${snap.totals.unknown_lots ? `<tr><th>未分類</th><td>${fmt(snap.totals.unknown_lots)} 張</td></tr>` : ""}
+      </table>
+    </section>
+    <section>${bookTable(snap)}</section>
+    <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
+    <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${money(snap.large_order_twd)} 元）`)}</section>
+    <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>
+    <section>${tradeTable(snap.recent_large_trades, "近期大單明細")}</section>`;
+}
+
+function renderTabs() {
+  document.getElementById("tabs").innerHTML = state.symbols.map(s =>
+    `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${s}">${s}</span>`).join("");
+  document.querySelectorAll(".tab").forEach(el =>
+    el.onclick = () => { state.active = el.dataset.symbol; renderTabs(); render(); });
+}
+
+const ws = new WebSocket(`ws://${location.host}/ws`);
+ws.onopen = () => document.getElementById("status").textContent = "已連線";
+ws.onclose = () => document.getElementById("status").textContent = "已斷線，請重整頁面";
+ws.onmessage = event => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === "init") {
+    state.snapshots = msg.snapshots;
+    state.symbols = Object.keys(msg.snapshots);
+    state.active = state.active ?? state.symbols[0];
+    document.getElementById("threshold").value = msg.large_order_twd;
+    renderTabs();
+  } else if (msg.type === "update") {
+    state.snapshots[msg.snapshot.symbol] = msg.snapshot;
+    if (msg.snapshot.symbol !== state.active) return;
+  }
+  render();
+};
+
+document.getElementById("apply").onclick = async () => {
+  const value = Number(document.getElementById("threshold").value);
+  if (!(value > 0)) return;
+  await fetch("/api/threshold", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ large_order_twd: value }),
+  });
+};
+</script>
