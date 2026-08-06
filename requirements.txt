@@ -3,3 +3,4 @@ certifi
 pyarrow
 fastapi
 uvicorn
+websockets

@@ -8,6 +8,7 @@ fugle-marketdata = "*"
 pyarrow = "*"
 fastapi = "*"
 uvicorn = "*"
+websockets = "*"
 
 [dev-packages]
 

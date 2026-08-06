@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -47,37 +48,78 @@ class Broadcaster:
         self._queues.discard(queue)
 
     def publish(self, symbol: str) -> None:
-        """可從任何執行緒呼叫。web 尚未啟動時安靜丟棄。"""
+        """可從任何執行緒呼叫。
+
+        兩端都要保護：web 尚未啟動時還沒有迴圈可綁（行情可能早於 uvicorn 就緒），
+        關機時迴圈已關閉但 SDK 執行緒仍在送訊息。兩種情況都安靜丟棄，
+        不可讓例外從 SDK 的回呼執行緒逸出。
+        """
         loop = self._loop
-        if loop is None:
+        if loop is None or loop.is_closed():
             return
         for queue in list(self._queues):
-            loop.call_soon_threadsafe(queue.put_nowait, symbol)
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, symbol)
+            except RuntimeError:
+                # 迴圈在上面的檢查之後才關閉 —— 這個競從無法用檢查消除
+                return
 
 
 class MarketState:
+    """所有聚合器狀態的持有者，並負責跨執行緒互斥。
+
+    兩個執行緒會寫入：Fugle SDK 的行情執行緒（record_trade / record_book），
+    以及 FastAPI 跑同步路由的工作執行緒（set_threshold）。所有寫入與讀取都
+    走同一把鎖，否則重算大單階梯時被切斷會造成永久性的重複計數。
+    """
+
     def __init__(self, symbols: list[str], large_order_twd: float) -> None:
         self.symbols = list(symbols)
         self.large_order_twd = large_order_twd
+        self._lock = threading.Lock()
         self._aggregators = {
             s: SymbolAggregator(s, large_order_twd) for s in self.symbols
         }
 
     def aggregator(self, symbol: str) -> SymbolAggregator:
+        """未加鎖的直接存取，僅供測試與單執行緒檢視。
+        正式的寫入路徑一律用 record_trade / record_book。"""
         if symbol not in self._aggregators:
             raise KeyError(symbol)
         return self._aggregators[symbol]
 
-    def snapshot(self, symbol: str) -> dict:
-        return self.aggregator(symbol).snapshot()
+    # -- 寫入（加鎖）------------------------------------------------------
+    def record_trade(self, trade: dict) -> dict | None:
+        """記錄一筆成交，回傳正規化紀錄；重複 serial 或未追蹤代碼回傳 None。"""
+        symbol = trade.get("symbol")
+        with self._lock:
+            aggregator = self._aggregators.get(symbol)
+            return aggregator.add_trade(trade) if aggregator is not None else None
 
-    def snapshot_all(self) -> dict:
-        return {s: a.snapshot() for s, a in self._aggregators.items()}
+    def record_book(self, book: dict) -> bool:
+        """更新五檔快照；未追蹤代碼回傳 False。"""
+        symbol = book.get("symbol")
+        with self._lock:
+            aggregator = self._aggregators.get(symbol)
+            if aggregator is None:
+                return False
+            aggregator.update_book(book)
+            return True
 
     def set_threshold(self, threshold_twd: float) -> None:
-        self.large_order_twd = threshold_twd
-        for aggregator in self._aggregators.values():
-            aggregator.set_threshold(threshold_twd)
+        with self._lock:
+            self.large_order_twd = threshold_twd
+            for aggregator in self._aggregators.values():
+                aggregator.set_threshold(threshold_twd)
+
+    # -- 讀取（加鎖）------------------------------------------------------
+    def snapshot(self, symbol: str) -> dict:
+        with self._lock:
+            return self.aggregator(symbol).snapshot()
+
+    def snapshot_all(self) -> dict:
+        with self._lock:
+            return {s: a.snapshot() for s, a in self._aggregators.items()}
 
 
 def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
@@ -92,7 +134,13 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
 
     @app.get("/")
     def index() -> FileResponse:
-        return FileResponse(_STATIC / "index.html")
+        path = _STATIC / "index.html"
+        if not path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"static index page missing: {path}",
+            )
+        return FileResponse(path)
 
     @app.get("/api/symbols")
     def symbols() -> dict:
@@ -103,7 +151,9 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
         try:
             return state.snapshot(symbol)
         except KeyError:
-            raise HTTPException(status_code=404, detail=f"symbol not tracked: {symbol}")
+            raise HTTPException(
+                status_code=404, detail=f"symbol not tracked: {symbol}"
+            ) from None
 
     @app.post("/api/threshold")
     def set_threshold(body: ThresholdIn) -> dict:
