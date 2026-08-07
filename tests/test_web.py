@@ -1,9 +1,13 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.web import Broadcaster, MarketState, create_app
+
+INDEX_HTML = (Path(__file__).resolve().parents[1]
+              / "app" / "static" / "index.html").read_text(encoding="utf-8")
 
 
 AT_ASK = {"symbol": "2330", "price": 2405, "size": 2, "bid": 2400, "ask": 2405,
@@ -13,8 +17,8 @@ BOOK = {"symbol": "2330",
         "asks": [{"price": 2395, "size": 343}], "time": 2}
 
 
-def build(symbols=("2330", "2317"), threshold=1_000_000):
-    state = MarketState(list(symbols), large_order_twd=threshold)
+def build(symbols=("2330", "2317"), threshold=5):
+    state = MarketState(list(symbols), large_order_lots=threshold)
     return state, TestClient(create_app(state, Broadcaster()))
 
 
@@ -22,7 +26,7 @@ def test_symbols_endpoint_lists_tracked_symbols():
     _, client = build()
     body = client.get("/api/symbols").json()
     assert body["symbols"] == ["2330", "2317"]
-    assert body["thresholds"] == {"2330": 1_000_000, "2317": 1_000_000}
+    assert body["thresholds"] == {"2330": 5, "2317": 5}
 
 
 def test_snapshot_endpoint_returns_ladder_and_book():
@@ -43,79 +47,87 @@ def test_snapshot_of_untracked_symbol_is_404():
 
 
 def test_threshold_endpoint_recomputes_every_symbol():
-    state, client = build(threshold=10_000_000)
-    state.aggregator("2330").add_trade(AT_ASK)          # 481 萬
+    state, client = build(threshold=10)
+    state.aggregator("2330").add_trade(AT_ASK)          # 2 張
     assert state.snapshot("2330")["large_ladder"] == []
 
-    response = client.post("/api/threshold", json={"large_order_twd": 1_000_000})
+    response = client.post("/api/threshold", json={"large_order_lots": 2})
     assert response.status_code == 200
-    assert response.json()["thresholds"] == {"2330": 1_000_000, "2317": 1_000_000}
+    assert response.json()["thresholds"] == {"2330": 2, "2317": 2}
     assert state.snapshot("2330")["large_ladder"][0]["buy_lots"] == 2
 
 
 def test_threshold_endpoint_rejects_non_positive():
     _, client = build()
-    assert client.post("/api/threshold", json={"large_order_twd": 0}).status_code == 422
+    assert client.post("/api/threshold", json={"large_order_lots": 0}).status_code == 422
+
+
+def test_threshold_endpoint_rejects_fractional_lots():
+    """門檻的單位是張，沒有半張這種東西 —— 收下 2.5 只會讓實際門檻
+    悄悄變成 3 張或 2 張，兩種都不是使用者要求的。"""
+    _, client = build()
+    assert client.post("/api/threshold",
+                       json={"large_order_lots": 2.5}).status_code == 422
 
 
 # -- 逐檔門檻 -------------------------------------------------------------
 
 def test_per_symbol_thresholds_from_mapping():
-    """高低價股共用一個門檻沒有意義：2330 一張 240 萬，2317 一張 25.8 萬。"""
+    """張數門檻仍需逐檔設定：成交量大的股票同樣張數不算大單。"""
     state = MarketState(["2330", "2317"],
-                        large_order_twd={"2330": 5_000_000, "2317": 800_000})
-    assert state.thresholds == {"2330": 5_000_000, "2317": 800_000}
-    assert state.snapshot("2330")["large_order_twd"] == 5_000_000
-    assert state.snapshot("2317")["large_order_twd"] == 800_000
+                        large_order_lots={"2330": 20, "2317": 3})
+    assert state.thresholds == {"2330": 20, "2317": 3}
+    assert state.snapshot("2330")["large_order_lots"] == 20
+    assert state.snapshot("2317")["large_order_lots"] == 3
 
 
 def test_thresholds_mapping_must_cover_every_symbol():
     with pytest.raises(KeyError):
-        MarketState(["2330", "2317"], large_order_twd={"2330": 5_000_000})
+        MarketState(["2330", "2317"], large_order_lots={"2330": 20})
 
 
 def test_thresholds_property_returns_a_copy():
-    state = MarketState(["2330"], large_order_twd=1_000_000)
+    state = MarketState(["2330"], large_order_lots=5)
     state.thresholds["2330"] = 42
-    assert state.thresholds == {"2330": 1_000_000}
+    assert state.thresholds == {"2330": 5}
 
 
 def test_set_threshold_for_one_symbol_leaves_the_others_alone():
-    state = MarketState(["2330", "2317"], large_order_twd=1_000_000)
-    state.set_threshold(5_000_000, "2330")
-    assert state.thresholds == {"2330": 5_000_000, "2317": 1_000_000}
-    assert state.snapshot("2317")["large_order_twd"] == 1_000_000
+    state = MarketState(["2330", "2317"], large_order_lots=5)
+    state.set_threshold(20, "2330")
+    assert state.thresholds == {"2330": 20, "2317": 5}
+    assert state.snapshot("2317")["large_order_lots"] == 5
 
 
 def test_set_threshold_for_untracked_symbol_raises():
-    state = MarketState(["2330"], large_order_twd=1_000_000)
+    state = MarketState(["2330"], large_order_lots=5)
     with pytest.raises(KeyError):
-        state.set_threshold(5_000_000, "9999")
+        state.set_threshold(20, "9999")
 
 
 def test_threshold_endpoint_can_target_a_single_symbol():
-    state, client = build(threshold=10_000_000)
-    state.aggregator("2330").add_trade(AT_ASK)          # 481 萬
+    state, client = build(threshold=10)
+    state.aggregator("2330").add_trade(AT_ASK)          # 2 張
 
     body = client.post("/api/threshold",
-                       json={"large_order_twd": 1_000_000, "symbol": "2330"}).json()
-    assert body["thresholds"] == {"2330": 1_000_000, "2317": 10_000_000}
+                       json={"large_order_lots": 2, "symbol": "2330"}).json()
+    assert body["thresholds"] == {"2330": 2, "2317": 10}
     assert state.snapshot("2330")["large_ladder"][0]["buy_lots"] == 2
-    assert state.snapshot("2317")["large_order_twd"] == 10_000_000
+    assert state.snapshot("2317")["large_order_lots"] == 10
 
 
 def test_threshold_endpoint_for_untracked_symbol_is_404():
     _, client = build()
     response = client.post("/api/threshold",
-                           json={"large_order_twd": 1_000_000, "symbol": "9999"})
+                           json={"large_order_lots": 5, "symbol": "9999"})
     assert response.status_code == 404
 
 
 def test_threshold_change_of_one_symbol_publishes_only_that_symbol():
-    state = MarketState(["2330", "2317"], large_order_twd=1_000_000)
+    state = MarketState(["2330", "2317"], large_order_lots=5)
     broadcaster = RecordingBroadcaster()
     client = TestClient(create_app(state, broadcaster))
-    client.post("/api/threshold", json={"large_order_twd": 5_000_000, "symbol": "2317"})
+    client.post("/api/threshold", json={"large_order_lots": 20, "symbol": "2317"})
     assert broadcaster.published == ["2317"]
 
 
@@ -131,11 +143,11 @@ class RecordingBroadcaster(Broadcaster):
 
 def test_websocket_init_carries_every_threshold():
     state = MarketState(["2330", "2317"],
-                        large_order_twd={"2330": 5_000_000, "2317": 800_000})
+                        large_order_lots={"2330": 20, "2317": 3})
     client = TestClient(create_app(state, Broadcaster()))
     with client.websocket_connect("/ws") as ws:
         first = ws.receive_json()
-    assert first["thresholds"] == {"2330": 5_000_000, "2317": 800_000}
+    assert first["thresholds"] == {"2330": 20, "2317": 3}
 
 
 # -- 事件迴圈 -------------------------------------------------------------
@@ -166,7 +178,7 @@ class LoopWatchingState(MarketState):
 def test_websocket_never_takes_the_lock_on_the_event_loop():
     """snapshot 會取 threading.Lock，而門檻重算持鎖（實測單檔 5 萬筆 27 ms）。
     在事件迴圈上等這把鎖會讓所有連線與所有 HTTP 請求一起停擺。"""
-    state = LoopWatchingState(["2330"], large_order_twd=1_000_000)
+    state = LoopWatchingState(["2330"], large_order_lots=5)
     broadcaster = Broadcaster()
     with TestClient(create_app(state, broadcaster)) as client:
         with client.websocket_connect("/ws") as ws:
@@ -181,6 +193,56 @@ def test_index_page_is_served():
     response = client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
+
+
+# -- 名稱與五檔訂閱旗標 ---------------------------------------------------
+
+def test_snapshot_carries_the_stock_name():
+    state = MarketState(["2330", "2317"], large_order_lots=5,
+                        names={"2330": "台積電"})
+    assert state.snapshot("2330")["name"] == "台積電"
+    assert state.snapshot("2317")["name"] == ""      # 取不到名稱不得炸掉
+
+
+def test_snapshot_reports_whether_the_book_is_subscribed():
+    """訂閱預算有限，五檔是選配 —— 畫面要能分辨「沒有買賣盤」與「沒訂」。"""
+    state = MarketState(["2330", "2317"], large_order_lots=5,
+                        book_symbols=["2330"])
+    assert state.snapshot("2330")["has_book"] is True
+    assert state.snapshot("2317")["has_book"] is False
+
+
+def test_book_subscription_defaults_to_none():
+    state = MarketState(["2330"], large_order_lots=5)
+    assert state.snapshot("2330")["has_book"] is False
+
+
+# -- 靜態頁面 -------------------------------------------------------------
+
+def test_index_page_drops_the_per_trade_large_order_table():
+    assert "近期大單明細" not in INDEX_HTML
+    assert "近期成交明細" in INDEX_HTML      # 一般成交明細仍在
+
+
+def test_index_page_uses_the_validated_chart_palette():
+    """配色經 dataviz 驗證器兩模式全項通過，不可自行更換。"""
+    assert "#e34948" in INDEX_HTML          # 淺色底：買
+    assert "#e66767" in INDEX_HTML          # 深色底：買
+    assert "#008300" in INDEX_HTML          # 兩模式：賣
+    assert "prefers-color-scheme: dark" in INDEX_HTML
+    assert ':root[data-theme="dark"]' in INDEX_HTML
+
+
+def test_index_page_chart_labels_both_axes_and_handles_empty_data():
+    assert "大單張數" in INDEX_HTML          # 左軸單位
+    assert "股價" in INDEX_HTML              # 右軸單位
+    assert "尚無大單" in INDEX_HTML          # 空資料狀態
+
+
+def test_index_page_pulls_no_external_resource():
+    """看盤畫面不得對外連線：沒有 CDN、沒有外部字型、沒有外部圖片。"""
+    for token in ("http://", "https://", "//cdn", "<script src", "<link"):
+        assert token not in INDEX_HTML, token
 
 
 def test_websocket_sends_full_snapshot_on_connect():
@@ -261,7 +323,7 @@ def test_threshold_change_is_correct_under_concurrent_ingest():
     """
     import threading
 
-    state = MarketState(["2330"], large_order_twd=1_000_000)
+    state = MarketState(["2330"], large_order_lots=1)
     for i in range(50_000):                       # 內盤(賣) @2400，重算需 ~27 ms
         state.record_trade({"symbol": "2330", "price": 2400, "size": 1, "bid": 2400,
                             "ask": 2405, "time": i, "serial": i})
@@ -278,7 +340,7 @@ def test_threshold_change_is_correct_under_concurrent_ingest():
     thread = threading.Thread(target=ingest)
     thread.start()
     try:
-        state.set_threshold(1_000_000)
+        state.set_threshold(1)
     finally:
         stop.set()
         thread.join()
@@ -286,12 +348,17 @@ def test_threshold_change_is_correct_under_concurrent_ingest():
     snapshot = state.snapshot("2330")
     fields = {"buy": "buy_lots", "sell": "sell_lots",
               "auction": "auction_lots", "unknown": "unknown_lots"}
+    trades = state.aggregator("2330").trades
+    large = [t for t in trades if t["lots"] >= snapshot["large_order_lots"]]
     expected: dict = {}
-    for trade in state.aggregator("2330").trades:
-        if trade["value_twd"] >= snapshot["large_order_twd"]:
-            key = (trade["price"], fields[trade["side"]])
-            expected[key] = expected.get(key, 0) + trade["lots"]
+    for trade in large:
+        key = (trade["price"], fields[trade["side"]])
+        expected[key] = expected.get(key, 0) + trade["lots"]
     actual = {(row["price"], field): row[field]
               for row in snapshot["large_ladder"]
               for field in fields.values() if row[field]}
     assert actual == expected
+
+    # 桶在同一把鎖下與大單階梯一起重算，同樣不得重複計數
+    assert sum(b["buy_lots"] + b["sell_lots"] for b in snapshot["buckets"]) == \
+        sum(t["lots"] for t in large)

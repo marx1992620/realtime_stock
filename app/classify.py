@@ -40,10 +40,18 @@ def classify_side(trade: dict) -> str:
 
 
 def trade_value_twd(price: float, lots: int) -> float:
-    """成交金額（台幣）。Fugle 的 size 單位是張，一張 1,000 股。"""
+    """成交金額（台幣）。Fugle 的 size 單位是張，一張 1,000 股。
+
+    門檻雖已改用張數，金額仍要算：Parquet 落 value_twd，日後想用金額門檻
+    回頭重算才有依據。
+    """
     return price * lots * SHARES_PER_LOT
 
 
-def is_large_order(trade: dict, threshold_twd: float) -> bool:
-    """該筆成交金額是否達到大單門檻。"""
-    return trade_value_twd(trade["price"], trade["size"]) >= threshold_twd
+def is_large_order(trade: dict, threshold_lots: int) -> bool:
+    """該筆成交張數是否達到大單門檻。
+
+    門檻的單位是張，與價格無關 —— 使用者盯的是「有人一次丟幾張」，
+    金額門檻會讓同一個數字對高低價股代表完全不同的規模。
+    """
+    return trade["size"] >= threshold_lots

@@ -77,13 +77,21 @@ def test_trade_value_handles_fractional_price():
     assert classify.trade_value_twd(257.5, 4) == 1_030_000
 
 
-@pytest.mark.parametrize("lots,expected", [(3, False), (4, True), (5, True)])
+@pytest.mark.parametrize("lots,expected", [(4, False), (5, True), (6, True)])
 def test_is_large_order_threshold_boundary(lots, expected):
-    # 2317 @ 258：1 張 = 258,000 元，門檻 100 萬 -> 需 4 張
+    """門檻是張數，不是金額：門檻 5 時 4 張不算、5 張算。"""
     trade = {"price": 258, "size": lots, "bid": 257.5, "ask": 258}
-    assert classify.is_large_order(trade, 1_000_000) is expected
+    assert classify.is_large_order(trade, 5) is expected
+
+
+def test_is_large_order_ignores_price():
+    """張數門檻與價格無關 —— 同樣 5 張，25.8 萬與 1,202 萬都算大單。"""
+    cheap = {"price": 258, "size": 5, "bid": 257.5, "ask": 258}
+    dear = {"price": 2405, "size": 5, "bid": 2400, "ask": 2405}
+    assert classify.is_large_order(cheap, 5) is True
+    assert classify.is_large_order(dear, 5) is True
 
 
 def test_auction_trade_can_also_be_large_order():
-    # 開盤那筆 2,024 張 × 2385 = 4.83 億，必定符合大單
-    assert classify.is_large_order(TRADE_AUCTION, 1_000_000) is True
+    # 開盤那筆 2,024 張遠超任何合理張數門檻
+    assert classify.is_large_order(TRADE_AUCTION, 5) is True

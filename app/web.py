@@ -25,8 +25,11 @@ PUSH_INTERVAL_SECONDS = 0.2
 
 
 class ThresholdIn(BaseModel):
-    large_order_twd: float = Field(gt=0)
-    # 未指定 symbol 表示套用全部；指定時只改該檔（高低價股的合理門檻差很多）。
+    # 單位是張，必須是正整數：沒有半張這種東西，收下 2.5 只會讓實際門檻
+    # 悄悄變成 2 張或 3 張，兩種都不是使用者要求的。
+    large_order_lots: int = Field(gt=0)
+    # 未指定 symbol 表示套用全部；指定時只改該檔（成交量差很多的股票
+    # 合理的張數門檻也差很多）。
     symbol: str | None = None
 
 
@@ -76,22 +79,29 @@ class MarketState:
     """
 
     def __init__(self, symbols: list[str],
-                 large_order_twd: float | dict[str, float]) -> None:
+                 large_order_lots: int | dict[str, int],
+                 names: dict[str, str] | None = None,
+                 book_symbols: list[str] | None = None) -> None:
         self.symbols = list(symbols)
         # 純數字 = 全部同一個門檻；dict 則必須涵蓋每一檔（缺漏就 KeyError，
         # 悄悄套用某個預設值只會讓錯誤的門檻在盤中無聲生效）。
         self._thresholds = {
-            s: (large_order_twd[s] if isinstance(large_order_twd, dict)
-                else large_order_twd)
+            s: (large_order_lots[s] if isinstance(large_order_lots, dict)
+                else large_order_lots)
             for s in self.symbols
         }
+        names = names or {}
+        # 五檔是選配（訂閱預算有限），快照要帶著這個事實給畫面。
+        with_book = set(book_symbols or ())
         self._lock = threading.Lock()
         self._aggregators = {
-            s: SymbolAggregator(s, self._thresholds[s]) for s in self.symbols
+            s: SymbolAggregator(s, self._thresholds[s],
+                                name=names.get(s, ""), has_book=s in with_book)
+            for s in self.symbols
         }
 
     @property
-    def thresholds(self) -> dict[str, float]:
+    def thresholds(self) -> dict[str, int]:
         """逐檔門檻的複本 —— 外部改動不得影響內部狀態。"""
         with self._lock:
             return dict(self._thresholds)
@@ -121,7 +131,7 @@ class MarketState:
             aggregator.update_book(book)
             return True
 
-    def set_threshold(self, threshold_twd: float, symbol: str | None = None) -> None:
+    def set_threshold(self, threshold_lots: int, symbol: str | None = None) -> None:
         """symbol 為 None 時套用全部；指定時只重算該檔。未追蹤代碼 raise KeyError。"""
         with self._lock:
             if symbol is None:
@@ -131,8 +141,8 @@ class MarketState:
             else:
                 raise KeyError(symbol)
             for name in targets:
-                self._thresholds[name] = threshold_twd
-                self._aggregators[name].set_threshold(threshold_twd)
+                self._thresholds[name] = threshold_lots
+                self._aggregators[name].set_threshold(threshold_lots)
 
     # -- 讀取（加鎖）------------------------------------------------------
     def snapshot(self, symbol: str) -> dict:
@@ -180,7 +190,7 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
     @app.post("/api/threshold")
     def set_threshold(body: ThresholdIn) -> dict:
         try:
-            state.set_threshold(body.large_order_twd, body.symbol)
+            state.set_threshold(body.large_order_lots, body.symbol)
         except KeyError:
             raise HTTPException(
                 status_code=404, detail=f"symbol not tracked: {body.symbol}"

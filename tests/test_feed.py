@@ -13,7 +13,7 @@ import types
 
 import pytest
 
-from app.feed import CHANNELS, FugleFeed
+from app.feed import FugleFeed
 
 
 class FakeStock:
@@ -60,10 +60,38 @@ def test_uses_exactly_one_connection_for_all_symbols(fake_sdk):
     assert len(fake_sdk.created) == 1, "API key 只允許一條連線"
 
 
-def test_subscribes_every_symbol_on_both_channels(fake_sdk):
+def test_subscribes_trades_only_by_default(fake_sdk):
+    """一條連線最多 5 個訂閱（實測第 6 個回 Subscription limit exceeded）。
+    預設只訂 trades，讓 5 檔股票剛好用滿預算。"""
     FugleFeed("k", ["2330", "2317"], lambda t: None, lambda b: None).run()
     subscribed = {(s["channel"], s["symbol"]) for s in fake_sdk.stock.subscriptions}
-    assert subscribed == {(c, s) for c in CHANNELS for s in ("2330", "2317")}
+    assert subscribed == {("trades", "2330"), ("trades", "2317")}
+
+
+def test_books_are_subscribed_only_for_requested_symbols(fake_sdk):
+    FugleFeed("k", ["2330", "2317"], lambda t: None, lambda b: None,
+              book_symbols=["2330"]).run()
+    subscribed = {(s["channel"], s["symbol"]) for s in fake_sdk.stock.subscriptions}
+    assert subscribed == {("trades", "2330"), ("trades", "2317"), ("books", "2330")}
+    assert len(fake_sdk.created) == 1, "五檔仍走同一條連線"
+
+
+def test_subscription_limit_error_is_recorded_not_just_printed(fake_sdk, capsys):
+    """超額訂閱目前只印一行 stderr 就繼續跑，那些股票整天沒有資料，
+    使用者無從察覺 —— 必須留下可供上層顯示的紀錄。"""
+    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed.handle_message(json.dumps({
+        "event": "error", "data": {"message": "Subscription limit exceeded"}}))
+    assert feed.subscription_errors == ["Subscription limit exceeded"]
+    assert "Subscription limit exceeded" in capsys.readouterr().err
+
+
+def test_other_api_errors_are_not_counted_as_subscription_errors(fake_sdk, capsys):
+    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed.handle_message(json.dumps({
+        "event": "error", "data": {"message": "Forbidden resource"}}))
+    assert feed.subscription_errors == []
+    assert "Forbidden resource" in capsys.readouterr().err
 
 
 def test_all_subscriptions_happen_after_authentication(fake_sdk):

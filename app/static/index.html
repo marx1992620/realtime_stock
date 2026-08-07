@@ -2,24 +2,92 @@
 <meta charset="utf-8">
 <title>台股即時大單追蹤</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 -apple-system, "PingFang TC", sans-serif; margin: 1rem; }
+  /* 配色經 dataviz 驗證器驗過（淺／深兩模式全項通過），勿自行更換。
+     買＝紅、賣＝綠，與台股看盤習慣一致。文字一律用中性色，顏色只出現在
+     資料的記號上。 */
+  :root {
+    color-scheme: light dark;
+    --buy: #e34948;
+    --sell: #008300;
+    --ink: #1c1c1c;
+    --muted-ink: #6b6b6b;
+    --grid: #dcdcdc;
+    --axis: #b4b4b4;
+    --surface: #ffffff;
+    --line: #8884;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --buy: #e66767;
+      --sell: #008300;
+      --ink: #e9e9e9;
+      --muted-ink: #9d9d9d;
+      --grid: #3a3a3a;
+      --axis: #565656;
+      --surface: #1b1b1b;
+    }
+  }
+  /* 明確指定主題時要蓋過系統偏好，兩個方向都要能蓋。 */
+  :root[data-theme="dark"] {
+    --buy: #e66767; --sell: #008300; --ink: #e9e9e9; --muted-ink: #9d9d9d;
+    --grid: #3a3a3a; --axis: #565656; --surface: #1b1b1b;
+  }
+  :root[data-theme="light"] {
+    --buy: #e34948; --sell: #008300; --ink: #1c1c1c; --muted-ink: #6b6b6b;
+    --grid: #dcdcdc; --axis: #b4b4b4; --surface: #ffffff;
+  }
+
+  body { font: 14px/1.5 -apple-system, "PingFang TC", sans-serif; margin: 1rem;
+         background: var(--surface); color: var(--ink); }
   header { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
   .tabs { display: flex; gap: .5rem; }
-  .tab { padding: .3rem .8rem; border: 1px solid #8884; border-radius: 4px; cursor: pointer; }
+  .tab { padding: .3rem .8rem; border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
   .tab.active { background: #8883; font-weight: 600; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-top: 1rem; }
-  section { border: 1px solid #8884; border-radius: 6px; padding: .6rem; }
+  section { border: 1px solid var(--line); border-radius: 6px; padding: .6rem; }
+  section.wide { grid-column: 1 / -1; }
   h2 { font-size: 1rem; margin: 0 0 .5rem; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: .2rem .4rem; text-align: right; border-bottom: 1px solid #8882; }
+  th, td { padding: .2rem .4rem; text-align: right; border-bottom: 1px solid #8882;
+           font-variant-numeric: tabular-nums; }
   th:first-child, td:first-child { text-align: left; }
-  .buy { color: #c0392b; }        /* 外盤，紅 */
-  .sell { color: #27ae60; }       /* 內盤，綠 */
+  .buy { color: var(--buy); }     /* 外盤 */
+  .sell { color: var(--sell); }   /* 內盤 */
   .auction { background: #8882; } /* 集合競價 */
   .scroll { max-height: 320px; overflow-y: auto; }
   .price { font-size: 1.6rem; font-weight: 700; }
-  .muted { opacity: .65; font-size: .85em; }
+  .muted { color: var(--muted-ink); font-size: .85em; }
+
+  /* -- 大單流向圖 -- */
+  .legend { display: flex; gap: 1rem; align-items: center; margin-bottom: .3rem; }
+  .legend span { display: inline-flex; align-items: center; gap: .35rem;
+                 color: var(--muted-ink); font-size: .85em; }
+  .key { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .key.buy { background: var(--buy); }
+  .key.sell { background: var(--sell); }
+  .key.close { width: 14px; height: 2px; border-radius: 1px; background: var(--ink); }
+  .chart { width: 100%; height: auto; display: block; overflow: visible; }
+  .chart .gridline { stroke: var(--grid); stroke-width: 1; }
+  .chart .zero { stroke: var(--axis); stroke-width: 1; }
+  .chart .tick { fill: var(--muted-ink); font-size: 11px; }
+  .chart .axis-title { fill: var(--muted-ink); font-size: 11px; }
+  /* 直接標示可能正好落在股價折線上（最新一格常常如此），描一圈底色當光暈，
+     否則深色的字疊在深色的線上會整個看不見。 */
+  .chart .num { fill: var(--ink); font-size: 11px; font-weight: 600;
+                stroke: var(--surface); stroke-width: 3px; stroke-linejoin: round;
+                paint-order: stroke fill; }
+  .chart .closeline { fill: none; stroke: var(--ink); stroke-width: 2;
+                      stroke-linejoin: round; stroke-linecap: round; }
+  .chart .closedot { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
+  .chart .hit { fill: var(--ink); opacity: 0; }
+  .chart .hit:hover { opacity: .07; }
+
+  #tip { position: fixed; z-index: 10; pointer-events: none;
+         background: var(--surface); color: var(--ink);
+         border: 1px solid var(--axis); border-radius: 5px;
+         padding: .35rem .5rem; font-size: .85em; line-height: 1.45;
+         box-shadow: 0 2px 8px #0003; font-variant-numeric: tabular-nums; }
+  #tip b { font-weight: 600; }
 </style>
 
 <header>
@@ -29,12 +97,19 @@
 </header>
 
 <div class="grid" id="panels"></div>
+<div id="tip" hidden></div>
 
 <script>
 const state = { snapshots: {}, symbols: [], active: null };
 const fmt = n => (n ?? 0).toLocaleString("zh-TW");
 const money = n => (n ?? 0).toLocaleString("zh-TW", { maximumFractionDigits: 0 });
 const clock = us => us ? new Date(us / 1000).toLocaleTimeString("zh-TW", { hour12: false }) : "—";
+const hhmm = us => new Date(us / 1000).toLocaleTimeString("zh-TW",
+  { hour12: false, hour: "2-digit", minute: "2-digit" });
+// 名稱來自 API，一律逸出後才進 innerHTML。
+const esc = s => String(s ?? "").replace(/[&<>"]/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const label = snap => esc(`${snap.symbol} ${snap.name || ""}`.trim());
 
 function sideLabel(side) {
   return { buy: "買", sell: "賣", auction: "競價", unknown: "?" }[side] ?? side;
@@ -73,6 +148,12 @@ function tradeTable(rows, title) {
 }
 
 function bookTable(snap) {
+  // 訂閱預算有限，五檔是選配 —— 要能分辨「沒有買賣盤」與「根本沒訂」。
+  if (!snap.has_book) {
+    return `<h2>五檔</h2><p class="muted">未訂閱五檔報價。
+      一條連線最多 5 個訂閱，每檔股票已佔 1 個；
+      需要時請以 <code>--with-book ${esc(snap.symbol)}</code> 啟動。</p>`;
+  }
   const rows = [];
   for (let i = snap.asks.length - 1; i >= 0; i--) {
     rows.push(`<tr><td class="sell">賣${i + 1}</td><td>${snap.asks[i].price}</td><td>${fmt(snap.asks[i].size)}</td></tr>`);
@@ -80,8 +161,143 @@ function bookTable(snap) {
   snap.bids.forEach((b, i) => {
     rows.push(`<tr><td class="buy">買${i + 1}</td><td>${b.price}</td><td>${fmt(b.size)}</td></tr>`);
   });
+  if (!rows.length) return `<h2>五檔</h2><p class="muted">尚無資料</p>`;
   return `<h2>五檔 <span class="muted">${clock(snap.book_time)}</span></h2>
     <table><tr><th>檔位</th><th>價格</th><th>張數</th></tr>${rows.join("")}</table>`;
+}
+
+// -- 大單流向圖 -----------------------------------------------------------
+// 原生 SVG，無任何外部套件。柱＝大單張數（買向上、賣向下，零線在中間），
+// 折線＝股價（右軸）。雙軸是使用者指定的；因此兩軸都標單位，格線只屬於
+// 左軸，避免暗示兩個尺度之間有什麼固定關係。
+const CH = { w: 880, h: 300, ml: 64, mr: 64, mt: 18, mb: 30 };
+const BUCKET_US = 5 * 60 * 1e6;
+
+function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  const exp = Math.pow(10, Math.floor(Math.log10(v)));
+  const f = v / exp;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * exp;
+}
+
+const tickText = v => Number(v.toFixed(1)).toLocaleString("zh-TW");
+
+// 柱子：資料端 4px 圓角，零線那端維持方角。
+function barPath(x, w, zeroY, len, up) {
+  const r = Math.min(4, w / 2, len);
+  if (up) {
+    const y = zeroY - len;
+    return `M${x} ${zeroY}L${x} ${y + r}Q${x} ${y} ${x + r} ${y}`
+         + `L${x + w - r} ${y}Q${x + w} ${y} ${x + w} ${y + r}L${x + w} ${zeroY}Z`;
+  }
+  const y = zeroY + len;
+  return `M${x} ${zeroY}L${x} ${y - r}Q${x} ${y} ${x + r} ${y}`
+       + `L${x + w - r} ${y}Q${x + w} ${y} ${x + w} ${y - r}L${x + w} ${zeroY}Z`;
+}
+
+function flowChart(snap) {
+  const buckets = snap.buckets || [];
+  const title = `<h2>大單流向 <span class="muted">五分鐘一格・≥ ${fmt(snap.large_order_lots)} 張</span></h2>`;
+  if (!buckets.length) return `${title}<p class="muted">尚無大單</p>`;
+
+  const plotW = CH.w - CH.ml - CH.mr;
+  const plotH = CH.h - CH.mt - CH.mb;
+  const zeroY = CH.mt + plotH / 2;
+  const half = plotH / 2;
+  const barMax = half - 14;              // 留 14px 給直接標示，柱子不會被切掉
+  const slot = plotW / buckets.length;
+  const barW = Math.max(1, Math.min(slot - 2, 18));   // 相鄰柱之間留 2px
+  const inset = (slot - barW) / 2;
+
+  const peak = Math.max(...buckets.map(b => Math.max(b.buy_lots, b.sell_lots)));
+  const top = niceCeil(peak);
+  const lotY = lots => (lots / top) * barMax;
+
+  const closes = buckets.map(b => b.close);
+  let pMin = Math.min(...closes), pMax = Math.max(...closes);
+  if (pMax - pMin < 1e-9) { pMax += 0.5; pMin -= 0.5; }   // 全場同價也要畫得出來
+  const priceY = p => CH.mt + 6 + (pMax - p) / (pMax - pMin) * (plotH - 12);
+
+  // 格線只屬於左軸（大單張數）；右軸只給端點刻度，不再畫一組格線。
+  const grid = [1, 0.5, 0, -0.5, -1].map(f => {
+    const y = zeroY - f * barMax;
+    const cls = f === 0 ? "zero" : "gridline";
+    return `<line class="${cls}" x1="${CH.ml}" y1="${y}" x2="${CH.ml + plotW}" y2="${y}"/>`
+         + `<text class="tick" x="${CH.ml - 8}" y="${y + 4}" text-anchor="end">${tickText(Math.abs(f) * top)}</text>`;
+  }).join("");
+
+  // 直接標示只給最大值與最新一格 —— 每根都標數字會蓋掉圖形本身。
+  let peakAt = -1, peakSide = "", peakVal = 0;
+  // 平手時取較晚的那格：同樣大的一筆，剛剛發生的比早上那筆有意思
+  buckets.forEach((b, i) => {
+    if (b.buy_lots >= peakVal && b.buy_lots > 0) { peakVal = b.buy_lots; peakAt = i; peakSide = "buy"; }
+    if (b.sell_lots >= peakVal && b.sell_lots > 0) { peakVal = b.sell_lots; peakAt = i; peakSide = "sell"; }
+  });
+  const last = buckets.length - 1;
+  const marked = new Set();
+  if (peakVal > 0) marked.add(`${peakAt}:${peakSide}`);
+  if (buckets[last].buy_lots) marked.add(`${last}:buy`);
+  if (buckets[last].sell_lots) marked.add(`${last}:sell`);
+
+  let bars = "", notes = "";
+  buckets.forEach((b, i) => {
+    const x = CH.ml + i * slot + inset;
+    const mid = CH.ml + i * slot + slot / 2;
+    [["buy", b.buy_lots, true], ["sell", b.sell_lots, false]].forEach(([side, lots, up]) => {
+      if (!lots) return;
+      const len = Math.max(2, lotY(lots));
+      // 買賣柱在零線兩側相接，各退 1px，湊出 2px 的底色間隙
+      const base = up ? zeroY - 1 : zeroY + 1;
+      bars += `<path d="${barPath(x, barW, base, len, up)}" fill="var(--${side})"/>`;
+      if (!marked.has(`${i}:${side}`)) return;
+      const y = up ? base - len - 5 : base + len + 12;
+      notes += `<text class="num" x="${mid}" y="${y}" text-anchor="middle">${fmt(lots)}</text>`;
+    });
+  });
+
+  const points = buckets.map((b, i) =>
+    `${CH.ml + i * slot + slot / 2},${priceY(b.close)}`).join(" ");
+  const lastX = CH.ml + last * slot + slot / 2;
+  const line = `<polyline class="closeline" points="${points}"/>`
+             + `<circle class="closedot" cx="${lastX}" cy="${priceY(closes[last])}" r="4"/>`;
+
+  // x 軸：格子多的時候抽樣。由右往左挑，最新一格一定留著，擠不下的往左捨棄，
+  // 標籤才不會互相疊字。
+  const step = Math.max(1, Math.ceil(buckets.length / 7));
+  const wanted = [];
+  for (let i = 0; i < buckets.length; i += step) wanted.push(i);
+  if (wanted[wanted.length - 1] !== last) wanted.push(last);
+  const kept = [];
+  for (let k = wanted.length - 1; k >= 0; k--) {
+    const x = CH.ml + wanted[k] * slot + slot / 2;
+    if (!kept.length || kept[kept.length - 1].x - x >= 46) kept.push({ i: wanted[k], x });
+  }
+  const times = kept.map(({ i, x }) =>
+    `<text class="tick" x="${x}" y="${CH.mt + plotH + 18}" text-anchor="middle">${
+      hhmm(buckets[i].t)}</text>`).join("");
+
+  const rightTicks = [pMax, pMin].map(p =>
+    `<text class="tick" x="${CH.ml + plotW + 8}" y="${priceY(p) + 4}">${tickText(p)}</text>`).join("");
+
+  const hits = buckets.map((_, i) =>
+    `<rect class="hit" data-i="${i}" x="${CH.ml + i * slot}" y="${CH.mt}" `
+    + `width="${slot}" height="${plotH}"/>`).join("");
+
+  return `${title}
+    <div class="legend">
+      <span><i class="key buy"></i>買（向上）</span>
+      <span><i class="key sell"></i>賣（向下）</span>
+      <span><i class="key close"></i>股價</span>
+    </div>
+    <svg class="chart" viewBox="0 0 ${CH.w} ${CH.h}" preserveAspectRatio="xMidYMid meet"
+         role="img" aria-label="每五分鐘大單買賣張數與股價">
+      ${grid}${bars}${line}${notes}${times}${rightTicks}
+      <text class="axis-title" x="14" y="${CH.mt + plotH / 2}" text-anchor="middle"
+            transform="rotate(-90 14 ${CH.mt + plotH / 2})">大單張數（張）</text>
+      <text class="axis-title" x="${CH.w - 12}" y="${CH.mt + plotH / 2}" text-anchor="middle"
+            transform="rotate(90 ${CH.w - 12} ${CH.mt + plotH / 2})">股價（元）</text>
+      ${hits}
+    </svg>`;
 }
 
 // 重繪前後保留使用者的位置與輸入。整塊替換 innerHTML 每秒最多發生 5 次
@@ -111,7 +327,7 @@ function render() {
 
   panels.innerHTML = `
     <section>
-      <h2>${snap.symbol}</h2>
+      <h2>${label(snap)}</h2>
       <div class="price">${snap.last_price ?? "—"}</div>
       <div class="muted">最新成交 ${clock(snap.last_trade_time)}｜共 ${fmt(snap.trade_count)} 筆</div>
       <table style="margin-top:.5rem">
@@ -122,19 +338,19 @@ function render() {
       </table>
       <div style="margin-top:.5rem">
         <label>大單門檻
-          <input id="threshold" type="number" min="1" step="100000"
-                 style="width: 9rem" value="${snap.large_order_twd}">
-          元
+          <input id="threshold" type="number" min="1" step="1"
+                 style="width: 6rem" value="${snap.large_order_lots}">
+          張
         </label>
         <button id="apply">套用</button>
-        <div class="muted">只影響 ${snap.symbol}；各檔可分別設定</div>
+        <div class="muted">只影響 ${label(snap)}；各檔可分別設定</div>
       </div>
     </section>
+    <section class="wide">${flowChart(snap)}</section>
     <section>${bookTable(snap)}</section>
     <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
-    <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${money(snap.large_order_twd)} 元）`)}</section>
-    <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>
-    <section>${tradeTable(snap.recent_large_trades, "近期大單明細")}</section>`;
+    <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${fmt(snap.large_order_lots)} 張）`)}</section>
+    <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>`;
 
   restoreScroll(panels, offsets);
   const fresh = document.getElementById("threshold");
@@ -148,19 +364,38 @@ function render() {
 
 async function applyThreshold() {
   const input = document.getElementById("threshold");
-  const value = Number(input.value);
-  if (!(value > 0)) return;
+  const lots = Math.floor(Number(input.value));   // 門檻的單位是張，沒有半張
+  if (!(lots > 0)) return;
   input.blur();                   // 送出後讓伺服器回來的值接手
   await fetch("/api/threshold", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ large_order_twd: value, symbol: state.active }),
+    body: JSON.stringify({ large_order_lots: lots, symbol: state.active }),
   });
 }
 
+// 提示框放在 #panels 之外，重繪不會把它連同事件一起換掉。
+const tip = document.getElementById("tip");
+document.addEventListener("mousemove", event => {
+  const hit = event.target.closest ? event.target.closest(".hit") : null;
+  const snap = state.snapshots[state.active];
+  const bucket = hit && snap && (snap.buckets || [])[Number(hit.dataset.i)];
+  if (!bucket) { tip.hidden = true; return; }
+  tip.innerHTML = `<b>${hhmm(bucket.t)}–${hhmm(bucket.t + BUCKET_US)}</b><br>
+    買 ${fmt(bucket.buy_lots)} 張<br>賣 ${fmt(bucket.sell_lots)} 張<br>
+    收盤 ${bucket.close}`;
+  tip.hidden = false;
+  const pad = 14;
+  const x = Math.min(event.clientX + pad, window.innerWidth - tip.offsetWidth - 4);
+  const y = Math.min(event.clientY + pad, window.innerHeight - tip.offsetHeight - 4);
+  tip.style.left = `${Math.max(4, x)}px`;
+  tip.style.top = `${Math.max(4, y)}px`;
+});
+
 function renderTabs() {
   document.getElementById("tabs").innerHTML = state.symbols.map(s =>
-    `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${s}">${s}</span>`).join("");
+    `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
+      label(state.snapshots[s])}</span>`).join("");
   document.querySelectorAll(".tab").forEach(el =>
     el.onclick = () => { state.active = el.dataset.symbol; renderTabs(); render(); });
 }
@@ -177,7 +412,7 @@ ws.onmessage = event => {
     state.snapshots = msg.snapshots;
     state.symbols = Object.keys(msg.snapshots);
     state.active = state.active ?? state.symbols[0];
-    // 門檻不另存：每檔快照都帶自己的 large_order_twd，面板直接讀那個。
+    // 門檻不另存：每檔快照都帶自己的 large_order_lots，面板直接讀那個。
     renderTabs();
   } else if (msg.type === "update") {
     state.snapshots[msg.snapshot.symbol] = msg.snapshot;
