@@ -36,7 +36,7 @@ def export_csv(parquet_path: Path, csv_path: Path) -> int:
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow({"time_taipei": _taipei(row.get("time")), **row})

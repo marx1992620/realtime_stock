@@ -223,6 +223,22 @@ def test_book_event_for_untracked_symbol_is_dropped_and_counted(fake_sdk):
     assert feed.dropped_events["trades"] == 0
 
 
+def test_unrecognised_channel_for_tracked_symbol_is_dropped_and_counted(fake_sdk):
+    """symbol 過濾之後才判斷 channel。trades/books 以外的 channel（例如
+    candles）目前直接 `return None`，跳過 `_note_dropped`，屬於計數器
+    要消滅的那種看不見的丟棄——與沒有 symbol 的事件同一類問題。"""
+    trades = []
+    books = []
+    feed = FugleFeed("k", ["2330"], trades.append, books.append)
+    feed.handle_message(json.dumps({
+        "event": "data", "channel": "candles",
+        "data": {"symbol": "2330", "open": 2400, "close": 2405, "time": 8},
+    }))
+    assert trades == []
+    assert books == []
+    assert feed.dropped_events["candles"] == 1
+
+
 def test_malformed_message_does_not_kill_the_feed(fake_sdk):
     trades = []
     feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)

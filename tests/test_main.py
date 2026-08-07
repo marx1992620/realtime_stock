@@ -29,6 +29,19 @@ def test_parse_args_rejects_non_positive_threshold():
         parse_args(["--symbols", "2330", "--large-order", "0"])
 
 
+def test_parse_args_rejects_nan_threshold():
+    """float("nan") <= 0 是 False，門檻會被接受；之後每筆 value_twd >= nan
+    比較恆為 False，變成永遠沒有大單卻不會有任何錯誤。"""
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "2330", "--large-order", "nan"])
+
+
+def test_parse_args_rejects_inf_threshold():
+    """同樣道理：inf 也會通過 <= 0 檢查，讓大單永遠判不出來。"""
+    with pytest.raises(SystemExit):
+        parse_args(["--symbols", "2330", "--large-order", "inf"])
+
+
 # -- 逐檔門檻 -------------------------------------------------------------
 
 def test_parse_args_accepts_per_symbol_thresholds():

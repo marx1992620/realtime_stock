@@ -89,6 +89,7 @@ class FugleFeed:
             return "Trade", self.on_trade, data
         if channel == "books":
             return "Book", self.on_book, data
+        self._note_dropped(channel, data)
         return None
 
     def _note_dropped(self, channel: str | None, data: dict) -> None:

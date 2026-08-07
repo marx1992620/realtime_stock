@@ -1,4 +1,5 @@
 import pyarrow.parquet as pq
+import pytest
 
 from app.storage import TRADE_SCHEMA, ParquetTradeWriter, output_path
 
@@ -136,6 +137,31 @@ def test_failed_flush_loses_only_that_batch(tmp_path, capsys):
     writer.append({**RECORD, "serial": 3})             # 之後仍能繼續落檔
     writer.close()
     assert [r["serial"] for r in pq.read_table(path).to_pylist()] == [13674373, 3]
+
+
+def test_closed_flag_is_set_before_flush_can_raise(tmp_path):
+    """close() 目前是 flush() -> writer.close() -> self._closed = True。
+    flush() 或 writer.close() 任一失敗都會讓 _closed 永遠設不到，daemon
+    行情執行緒仍可能通過關檔後的 append 護欄，湊滿批次時重開同路徑的
+    ParquetWriter，把已經寫完的檔案截斷成殘骸。_closed 必須是 close() 的
+    第一步，不管後面是否拋出。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path, batch_size=100)   # 不會自動觸發 flush
+    writer.append(RECORD)
+
+    def boom():
+        raise RuntimeError("flush blew up")
+    writer.flush = boom
+
+    with pytest.raises(RuntimeError):
+        writer.close()
+
+    assert writer._closed is True, "即使 flush() 拋出，_closed 也必須已經被設定"
+    assert not path.exists(), "flush 失敗、從未真的開檔，不該有新檔案冒出來"
+
+    writer.append(RECORD)                                # 之後仍視為關檔後
+    assert writer.dropped_after_close == 1
+    assert not path.exists(), "關檔後的 append 不得寫檔"
 
 
 def test_output_path_layout(tmp_path):

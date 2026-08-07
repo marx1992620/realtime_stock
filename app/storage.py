@@ -87,11 +87,11 @@ class ParquetTradeWriter:
             self._buffer.clear()
 
     def close(self) -> None:
+        self._closed = True
         self.flush()
         if self._writer is not None:
             self._writer.close()
             self._writer = None
-        self._closed = True
         if self.dropped_after_close:
             print(f"{self.path}: dropped {self.dropped_after_close} record(s) "
                   "appended after close", file=sys.stderr, flush=True)

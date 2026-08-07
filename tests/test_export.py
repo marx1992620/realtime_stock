@@ -1,9 +1,11 @@
 import csv
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from app.export import export_csv
-from app.storage import ParquetTradeWriter
+from app.storage import TRADE_SCHEMA, ParquetTradeWriter
 
 
 RECORD = {"symbol": "2330", "serial": 1, "time": 1785902209312276, "price": 2405.0,
@@ -50,3 +52,26 @@ def test_export_has_no_is_large_column(tmp_path):
 def test_export_missing_source_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         export_csv(tmp_path / "nope.parquet", tmp_path / "out.csv")
+
+
+def test_export_survives_old_schema_parquet_with_is_large(tmp_path):
+    """舊版 Parquet（is_large 移除前寫的檔）落檔的每一列仍帶著 is_large 這個
+    鍵，但 CSV_FIELDS 只剩現行 TRADE_SCHEMA 的八欄。csv.DictWriter 預設
+    extrasaction="raise"，遇到多出來的鍵會直接 ValueError，讓一個舊檔案
+    中斷整個 export 迴圈（main() 逐檔匯出，一檔炸掉就全部沒匯出）。"""
+    old_schema = pa.schema(list(TRADE_SCHEMA) + [("is_large", pa.bool_())])
+    source = tmp_path / "trades_old.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [RECORD, {**RECORD, "serial": 2, "side": "sell", "is_large": False}],
+            schema=old_schema),
+        source)
+
+    target = tmp_path / "trades_old.csv"
+    assert export_csv(source, target) == 2
+
+    reader = csv.DictReader(target.open(encoding="utf-8"))
+    assert "is_large" not in reader.fieldnames
+    rows = list(reader)
+    assert len(rows) == 2
+    assert [r["side"] for r in rows] == ["buy", "sell"]

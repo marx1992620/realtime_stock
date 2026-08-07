@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import math
 import os
 import sys
 import threading
@@ -61,6 +62,8 @@ def _amount(raw: str, what: str) -> float:
         value = float(raw)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{what}不是數字：{raw!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"{what}必須是有限數字：{raw!r}")
     if value <= 0:
         raise argparse.ArgumentTypeError(f"{what}必須大於 0：{raw!r}")
     return value
