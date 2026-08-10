@@ -9,17 +9,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.aggregator import SymbolAggregator
+from app.feed import MAX_SUBSCRIPTIONS
 
 _STATIC = Path(__file__).resolve().parent / "static"
+
+# 代碼格式：台股 4 位數，部分權證／ETF 到 6 位。純粹是形狀檢查，擋掉打錯的
+# 輸入；REST 查名稱那一步才是真正判斷「這檔股票是否存在」。
+_SYMBOL_RE = re.compile(r"^\d{4,6}$")
 
 # 五檔每秒可有數次更新，逐一推送對瀏覽器沒有意義；同一檔在此間隔內合併。
 PUSH_INTERVAL_SECONDS = 0.2
@@ -32,6 +39,13 @@ class ThresholdIn(BaseModel):
     # 未指定 symbol 表示套用全部；指定時只改該檔（成交量差很多的股票
     # 合理的張數門檻也差很多）。
     symbol: str | None = None
+
+
+class SymbolIn(BaseModel):
+    symbol: str
+    # 選填；未指定時沿用啟動時的預設門檻（由 create_app 的
+    # default_large_order_lots 帶入）。
+    large_order_lots: int | None = Field(default=None, gt=0)
 
 
 class Broadcaster:
@@ -94,7 +108,13 @@ class MarketState:
         names = names or {}
         # 五檔是選配（訂閱預算有限），快照要帶著這個事實給畫面。
         with_book = set(book_symbols or ())
-        self._lock = threading.Lock()
+        # RLock 而非 Lock：新增／移除標的（Task 14）是「檢查 → 預算檢查 →
+        # REST 取名 → 建立聚合器 → 通知 feed」一整串複合動作，全部要在同一次
+        # 鎖持有期間完成才不會被另一個並發請求插隊造成重複建立；route handler
+        # 因此要能整段包在 `with state.lock:` 裡，同時內部呼叫
+        # add_symbol/remove_symbol 這些一樣會自己上鎖的方法——同一執行緒的
+        # 重入用一般 Lock 會直接死鎖，必須是 RLock。
+        self.lock = threading.RLock()
         self._aggregators = {
             s: SymbolAggregator(s, self._thresholds[s],
                                 name=names.get(s, ""), has_book=s in with_book)
@@ -104,7 +124,7 @@ class MarketState:
     @property
     def thresholds(self) -> dict[str, int]:
         """逐檔門檻的複本 —— 外部改動不得影響內部狀態。"""
-        with self._lock:
+        with self.lock:
             return dict(self._thresholds)
 
     def aggregator(self, symbol: str) -> SymbolAggregator:
@@ -118,14 +138,14 @@ class MarketState:
     def record_trade(self, trade: dict) -> dict | None:
         """記錄一筆成交，回傳正規化紀錄；重複 serial 或未追蹤代碼回傳 None。"""
         symbol = trade.get("symbol")
-        with self._lock:
+        with self.lock:
             aggregator = self._aggregators.get(symbol)
             return aggregator.add_trade(trade) if aggregator is not None else None
 
     def record_book(self, book: dict) -> bool:
         """更新五檔快照；未追蹤代碼回傳 False。"""
         symbol = book.get("symbol")
-        with self._lock:
+        with self.lock:
             aggregator = self._aggregators.get(symbol)
             if aggregator is None:
                 return False
@@ -134,7 +154,7 @@ class MarketState:
 
     def set_threshold(self, threshold_lots: int, symbol: str | None = None) -> None:
         """symbol 為 None 時套用全部；指定時只重算該檔。未追蹤代碼 raise KeyError。"""
-        with self._lock:
+        with self.lock:
             if symbol is None:
                 targets = list(self._aggregators)
             elif symbol in self._aggregators:
@@ -145,13 +165,38 @@ class MarketState:
                 self._thresholds[name] = threshold_lots
                 self._aggregators[name].set_threshold(threshold_lots)
 
+    # -- 動態增刪標的（Task 14，加鎖）---------------------------------------
+    def has_symbol(self, symbol: str) -> bool:
+        with self.lock:
+            return symbol in self._aggregators
+
+    def add_symbol(self, symbol: str, large_order_lots: int, name: str = "") -> None:
+        """建立新代碼的聚合器。已在追蹤中則 raise KeyError——正式的呼叫路徑
+        應該先用 has_symbol 在同一段鎖內查過，這裡是最後一道防呆，不是
+        主要的檢查點。"""
+        with self.lock:
+            if symbol in self._aggregators:
+                raise KeyError(symbol)
+            self.symbols.append(symbol)
+            self._thresholds[symbol] = large_order_lots
+            self._aggregators[symbol] = SymbolAggregator(symbol, large_order_lots, name=name)
+
+    def remove_symbol(self, symbol: str) -> None:
+        """移除一檔的聚合器；未追蹤則 raise KeyError。"""
+        with self.lock:
+            if symbol not in self._aggregators:
+                raise KeyError(symbol)
+            self.symbols.remove(symbol)
+            del self._thresholds[symbol]
+            del self._aggregators[symbol]
+
     # -- 讀取（加鎖）------------------------------------------------------
     def snapshot(self, symbol: str) -> dict:
-        with self._lock:
+        with self.lock:
             return self.aggregator(symbol).snapshot()
 
     def snapshot_all(self) -> dict:
-        with self._lock:
+        with self.lock:
             return {s: a.snapshot() for s, a in self._aggregators.items()}
 
 
@@ -160,14 +205,30 @@ def _feed_status(feed) -> dict:
 
     沒有 feed 時回一個「未連線」的預設值，而不是讓 /api/feed 或 ws 訊息
     整個少一個欄位——前端不必為兩種形狀各寫一份分支。
+
+    訂閱用量（Task 14 D）也從這裡帶出去：/api/feed 與 ws 的 init／update
+    都經過這個函式，畫面才能在同一個既有的輪詢／推播管道上顯示「訂閱 x/5」，
+    不必再多開一條路徑。
     """
     if feed is None:
         return {"state": "stopped", "last_message_ago": None,
-                "reconnects": 0, "subscription_errors": []}
-    return feed.status()
+                "reconnects": 0, "subscription_errors": [],
+                "subscription_count": 0, "subscription_limit": MAX_SUBSCRIPTIONS}
+    payload = dict(feed.status())
+    payload["subscription_count"] = feed.subscription_count
+    payload["subscription_limit"] = MAX_SUBSCRIPTIONS
+    return payload
 
 
-def create_app(state: MarketState, broadcaster: Broadcaster, feed=None) -> FastAPI:
+def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
+               pipeline=None,
+               lookup_name: Callable[[str], str | None] | None = None,
+               default_large_order_lots: int | None = None) -> FastAPI:
+    """pipeline／lookup_name 都是選配的協作物件，讓新增／移除標的的端點能
+    分別建立與關閉該代碼的 writer（pipeline.add_writer/remove_writer）、
+    以 REST 查名稱（lookup_name）——兩者都注入而不是寫死 import，這樣
+    web.py 本身不必知道 fugle_marketdata SDK 或 Pipeline 的具體實作，測試
+    可以用假物件替換，__main__.py 才是真正接上 SDK 與檔案系統的地方。"""
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 廣播器要在事件迴圈起來後才能綁定。使用 lifespan 而非
@@ -189,6 +250,70 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None) -> FastA
 
     @app.get("/api/symbols")
     def symbols() -> dict:
+        # state.symbols 從 Task 14 起會在執行中變長變短；加鎖讀出一份複本，
+        # 不然序列化成 JSON 的當下若正好被另一個請求 append/remove，可能讀到
+        # 變動中的清單。
+        with state.lock:
+            return {"symbols": list(state.symbols), "thresholds": state.thresholds}
+
+    @app.post("/api/symbols")
+    def add_symbol(body: SymbolIn) -> dict:
+        symbol = body.symbol
+        if not _SYMBOL_RE.match(symbol):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid symbol format (need 4-6 digits): {symbol!r}")
+        large_order_lots = body.large_order_lots or default_large_order_lots
+        if large_order_lots is None:
+            raise HTTPException(status_code=400, detail="large_order_lots is required")
+
+        # 整段流程（重複檢查、預算檢查、REST 取名、建立聚合器與 writer、
+        # 通知 feed 訂閱）都在同一次鎖持有期間完成：任何一步失敗都不留下
+        # 半成品狀態，並發的兩個新增請求也不會同時通過檢查、各建一份。
+        with state.lock:
+            if state.has_symbol(symbol):
+                raise HTTPException(
+                    status_code=409, detail=f"symbol already tracked: {symbol}")
+
+            used = feed.subscription_count if feed is not None else len(state.symbols)
+            if used + 1 > MAX_SUBSCRIPTIONS:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"訂閱數已達上限（目前 {used}/{MAX_SUBSCRIPTIONS}），"
+                           "請先移除一檔再新增")
+
+            name = ""
+            if lookup_name is not None:
+                looked_up = lookup_name(symbol)
+                # 取不到名稱視為無效代碼：這同時擋掉打錯的代碼，比訂閱送出去
+                # 才發現沒有資料好——那種情況整天不會有任何錯誤。
+                if looked_up is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"symbol not found: {symbol}")
+                name = looked_up
+
+            if pipeline is not None:
+                pipeline.add_writer(symbol)
+            state.add_symbol(symbol, large_order_lots, name=name)
+            if feed is not None:
+                feed.add_symbol(symbol)
+
+        broadcaster.publish(symbol)
+        return {"symbols": state.symbols, "thresholds": state.thresholds}
+
+    @app.delete("/api/symbols/{symbol}")
+    def remove_symbol(symbol: str) -> dict:
+        with state.lock:
+            if not state.has_symbol(symbol):
+                raise HTTPException(
+                    status_code=404, detail=f"symbol not tracked: {symbol}")
+            if feed is not None:
+                feed.remove_symbol(symbol)
+            if pipeline is not None:
+                # 務必 close()：不關掉的話緩衝在記憶體裡還沒滿一批的成交
+                # 會直接遺失，pipeline.remove_writer 內部負責呼叫 close()。
+                pipeline.remove_writer(symbol)
+            state.remove_symbol(symbol)
         return {"symbols": state.symbols, "thresholds": state.thresholds}
 
     @app.get("/api/feed")
@@ -212,7 +337,10 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None) -> FastA
             raise HTTPException(
                 status_code=404, detail=f"symbol not tracked: {body.symbol}"
             ) from None
-        for symbol in ([body.symbol] if body.symbol is not None else state.symbols):
+        # 同上：state.symbols 可能在執行中被增刪，取一份複本再迭代。
+        with state.lock:
+            targets = [body.symbol] if body.symbol is not None else list(state.symbols)
+        for symbol in targets:
             broadcaster.publish(symbol)
         return {"thresholds": state.thresholds}
 
@@ -271,7 +399,13 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None) -> FastA
                     while not queue.empty():
                         pending_symbols.add(queue.get_nowait())
                     for name in pending_symbols:
-                        snapshot = await asyncio.to_thread(state.snapshot, name)
+                        try:
+                            snapshot = await asyncio.to_thread(state.snapshot, name)
+                        except KeyError:
+                            # Task 14：這檔代碼可能在 publish 進佇列之後、這裡
+                            # 取快照之前被 DELETE /api/symbols/{symbol} 移除，
+                            # 安靜跳過即可，不必讓整條 ws 連線因此掛掉。
+                            continue
                         await websocket.send_json({"type": "update",
                                                    "snapshot": snapshot,
                                                    "feed": _feed_status(feed)})

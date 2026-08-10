@@ -33,6 +33,13 @@ class FakeStock:
         self.subscriptions.append(params)
         self.timeline.append(("subscribe", params["channel"], params["symbol"]))
 
+    def unsubscribe(self, params):
+        self.subscriptions = [
+            s for s in self.subscriptions
+            if not (s["channel"] == params["channel"] and s["symbol"] == params["symbol"])
+        ]
+        self.timeline.append(("unsubscribe", params["channel"], params["symbol"]))
+
     def connect(self):
         self.timeline.append(("auth_frame_sent",))
         self.handlers["connect"]()
@@ -446,3 +453,34 @@ def test_d_backfill_replays_missed_rest_trades_into_on_trade(monkeypatch):
     assert [t["serial"] for t in seen] == [501, 502]
     assert all(t["symbol"] == "2330" for t in seen), "REST 沒有 symbol 欄位，要自己補上"
     assert calls[0] == {"symbol": "2330", "limit": 500, "offset": 0}
+
+
+# -- Task 14 C：盤中動態增刪標的 ----------------------------------------------
+#
+# 測試從簡：一個測試證明重連會用「當下」的清單重新訂閱就好，不窮舉。
+
+def test_reconnect_resubscribes_the_current_symbol_list_not_the_startup_one(fake_sdk):
+    """add_symbol/remove_symbol 之後若斷線重連，_subscribe_all 必須用當下的
+    self.symbols，不是啟動時那份——動態加過的代碼要被訂回來，動態移除的
+    代碼不該再被訂閱回去。"""
+    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    thread = threading.Thread(target=feed.run, daemon=True)
+    thread.start()
+    assert fake_sdk.stock.connected.wait(timeout=2), "初次連線沒有在時限內完成"
+    feed._wait_before_reconnect = lambda seconds: feed._stop_event.wait(timeout=0)
+
+    feed.add_symbol("2454")            # 盤中動態加入
+    feed.remove_symbol("2330")         # 盤中動態移除
+    assert feed.subscription_count == 1
+
+    fake_sdk.stock.connected.clear()
+    fake_sdk.stock.subscriptions.clear()
+    fake_sdk.stock.disconnect()        # 觸發重連
+
+    assert fake_sdk.stock.connected.wait(timeout=2), "應該要重新連線"
+    feed.stop()
+    thread.join(timeout=2)
+
+    subscribed = {(s["channel"], s["symbol"]) for s in fake_sdk.stock.subscriptions}
+    assert subscribed == {("trades", "2454")}, \
+        f"重連應以當下清單訂閱，不是啟動時那份：{subscribed}"

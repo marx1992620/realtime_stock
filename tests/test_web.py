@@ -149,12 +149,26 @@ class RecordingBroadcaster(Broadcaster):
 
 
 class FakeFeed:
-    def __init__(self, state="connected", reconnects=0, last_message_ago=1.5):
+    def __init__(self, state="connected", reconnects=0, last_message_ago=1.5,
+                 subscription_count=1):
         self._payload = {"state": state, "last_message_ago": last_message_ago,
                          "reconnects": reconnects, "subscription_errors": []}
+        # Task 14：新增／移除標的的假物件，讓 test_web.py 能驗證端點呼叫到
+        # feed 而不必接一個真的 FugleFeed（測試不得動到那個正在跑的實例）。
+        self.subscription_count = subscription_count
+        self.added: list[str] = []
+        self.removed: list[str] = []
 
     def status(self) -> dict:
         return dict(self._payload)
+
+    def add_symbol(self, symbol: str, with_book: bool = False) -> None:
+        self.added.append(symbol)
+        self.subscription_count += 1
+
+    def remove_symbol(self, symbol: str) -> None:
+        self.removed.append(symbol)
+        self.subscription_count -= 1
 
 
 def test_feed_status_is_exposed_via_rest_and_ws_messages():
@@ -164,7 +178,8 @@ def test_feed_status_is_exposed_via_rest_and_ws_messages():
 
     body = client.get("/api/feed").json()
     assert body == {"state": "reconnecting", "last_message_ago": 1.5,
-                    "reconnects": 2, "subscription_errors": []}
+                    "reconnects": 2, "subscription_errors": [],
+                    "subscription_count": 1, "subscription_limit": 5}
 
     with client.websocket_connect("/ws") as ws:
         first = ws.receive_json()
@@ -513,3 +528,88 @@ def test_ws_cancellation_still_unsubscribes_without_leaking_tasks():
         assert broadcaster._queues == set(), "cancel 後也必須移除訂閱"
 
     asyncio.run(scenario())
+
+
+# -- Task 14：動態增刪監控標的 -----------------------------------------------
+#
+# 測試從簡：每個端點一個測試即可，重點是功能會動，不窮舉邊界。
+
+class RecordingPipeline:
+    """假的 writer 管理者：只記錄呼叫過誰，不真的碰檔案系統。"""
+
+    def __init__(self) -> None:
+        self.added: list[str] = []
+        self.removed: list[str] = []
+
+    def add_writer(self, symbol: str) -> None:
+        self.added.append(symbol)
+
+    def remove_writer(self, symbol: str) -> None:
+        self.removed.append(symbol)
+
+
+def test_post_symbols_adds_a_new_symbol_and_subscribes_it_on_the_feed():
+    state = MarketState(["2330"], large_order_lots=5)
+    feed = FakeFeed(subscription_count=1)
+    pipeline = RecordingPipeline()
+    client = TestClient(create_app(state, Broadcaster(), feed, pipeline=pipeline,
+                                   lookup_name=lambda symbol: "聯發科",
+                                   default_large_order_lots=10))
+
+    response = client.post("/api/symbols", json={"symbol": "2454"})
+
+    assert response.status_code == 200
+    assert response.json()["symbols"] == ["2330", "2454"]
+    assert state.snapshot("2454")["name"] == "聯發科"      # 名稱有帶到
+    assert feed.added == ["2454"]                          # feed 收到訂閱呼叫
+    assert pipeline.added == ["2454"]                       # writer 也建立了
+
+
+def test_post_symbols_over_budget_is_409():
+    state = MarketState(["2330"], large_order_lots=5)
+    feed = FakeFeed(subscription_count=5)          # 已經滿額（上限 5）
+
+    def must_not_be_called(symbol):
+        raise AssertionError("預算超過就該擋下，不該再去查名稱")
+
+    client = TestClient(create_app(state, Broadcaster(), feed,
+                                   lookup_name=must_not_be_called,
+                                   default_large_order_lots=10))
+
+    response = client.post("/api/symbols", json={"symbol": "2454"})
+
+    assert response.status_code == 409
+    assert "5" in response.json()["detail"]
+    assert "2454" not in state.symbols
+    assert feed.added == []
+
+
+def test_post_symbols_unknown_symbol_from_rest_is_404():
+    """REST 查不到名稱視為打錯代碼，比訂閱送出去才發現沒資料好。"""
+    state = MarketState(["2330"], large_order_lots=5)
+    feed = FakeFeed(subscription_count=1)
+    client = TestClient(create_app(state, Broadcaster(), feed,
+                                   lookup_name=lambda symbol: None,
+                                   default_large_order_lots=10))
+
+    response = client.post("/api/symbols", json={"symbol": "9999"})
+
+    assert response.status_code == 404
+    assert "9999" not in state.symbols
+    assert feed.added == []
+
+
+def test_delete_symbols_removes_symbol_closes_writer_and_unsubscribes():
+    state = MarketState(["2330", "2317"], large_order_lots=5)
+    feed = FakeFeed(subscription_count=2)
+    pipeline = RecordingPipeline()
+    client = TestClient(create_app(state, Broadcaster(), feed, pipeline=pipeline))
+
+    response = client.delete("/api/symbols/2317")
+
+    assert response.status_code == 200
+    assert response.json()["symbols"] == ["2330"]           # 清單變短
+    assert feed.removed == ["2317"]                          # feed 收到退訂呼叫
+    assert pipeline.removed == ["2317"]                      # writer 被關閉（close 在 Pipeline.remove_writer 內）
+    with pytest.raises(KeyError):
+        state.aggregator("2317")

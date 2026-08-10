@@ -48,9 +48,17 @@
   body { font: 14px/1.5 -apple-system, "PingFang TC", sans-serif; margin: 1rem;
          background: var(--surface); color: var(--ink); }
   header { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
-  .tabs { display: flex; gap: .5rem; }
-  .tab { padding: .3rem .8rem; border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+  .tabs { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .tab { padding: .3rem .5rem .3rem .8rem; border: 1px solid var(--line); border-radius: 4px;
+         cursor: pointer; display: inline-flex; align-items: center; gap: .3rem; }
   .tab.active { background: #8883; font-weight: 600; }
+  .tab-remove { border: none; background: none; color: inherit; cursor: pointer;
+                font: inherit; line-height: 1; padding: 0 .15rem; opacity: .55; }
+  .tab-remove:hover { opacity: 1; }
+  .add-symbol { display: flex; gap: .3rem; align-items: center; }
+  .add-symbol input { width: 5.5rem; font: inherit; }
+  #symbolError { color: var(--bad); font-size: .85em; }
+  #subUsage { color: var(--muted-ink); font-size: .85em; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-top: 1rem; }
   section { border: 1px solid var(--line); border-radius: 6px; padding: .6rem; }
   section.wide { grid-column: 1 / -1; }
@@ -113,8 +121,14 @@
 <header>
   <strong>台股即時大單追蹤</strong>
   <div class="tabs" id="tabs"></div>
+  <div class="add-symbol">
+    <input id="newSymbol" type="text" placeholder="代碼（例如 2454）" maxlength="6">
+    <button id="addSymbolBtn">新增</button>
+  </div>
+  <span id="subUsage"></span>
   <span id="status"><i class="dot"></i>連線中…</span>
 </header>
+<div id="symbolError" hidden></div>
 
 <div class="grid" id="panels"></div>
 <div id="tip" hidden></div>
@@ -415,10 +429,91 @@ document.addEventListener("mousemove", event => {
 function renderTabs() {
   document.getElementById("tabs").innerHTML = state.symbols.map(s =>
     `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
-      label(state.snapshots[s])}</span>`).join("");
+      label(state.snapshots[s])
+    }<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button></span>`
+  ).join("");
   document.querySelectorAll(".tab").forEach(el =>
-    el.onclick = () => { state.active = el.dataset.symbol; renderTabs(); render(); });
+    el.addEventListener("click", event => {
+      if (event.target.closest(".tab-remove")) return;   // 交給移除鈕自己的 handler
+      state.active = el.dataset.symbol; renderTabs(); render();
+    }));
+  document.querySelectorAll(".tab-remove").forEach(btn =>
+    btn.addEventListener("click", event => {
+      event.stopPropagation();
+      removeSymbol(btn.dataset.symbol);
+    }));
 }
+
+// -- 新增／移除監控標的（Task 14）-------------------------------------------
+// 失敗時把伺服器回傳的訊息顯示出來，不要靜默失敗——「訂閱數已達上限」
+// 「查無此代碼」這類原因，使用者需要知道才知道下一步怎麼辦。
+function showSymbolError(message) {
+  const el = document.getElementById("symbolError");
+  el.textContent = message;
+  el.hidden = false;
+}
+
+function clearSymbolError() {
+  document.getElementById("symbolError").hidden = true;
+}
+
+async function addSymbol() {
+  const input = document.getElementById("newSymbol");
+  const symbol = input.value.trim();
+  if (!symbol) return;
+  clearSymbolError();
+  let response;
+  try {
+    response = await fetch("/api/symbols", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol }),
+    });
+  } catch {
+    showSymbolError("新增失敗：無法連線到伺服器");
+    return;
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    showSymbolError(body.detail || `新增失敗（HTTP ${response.status}）`);
+    return;
+  }
+  input.value = "";
+  state.symbols = body.symbols;
+  // 立刻要一份快照，不必空等下一次 ws 推播才看得到剛加的分頁內容
+  // （新代碼還沒有任何成交時，快照本身就是合理的空狀態）。
+  const snapResponse = await fetch(`/api/snapshot/${encodeURIComponent(symbol)}`);
+  if (snapResponse.ok) state.snapshots[symbol] = await snapResponse.json();
+  state.active = symbol;
+  renderTabs();
+  render();
+}
+
+async function removeSymbol(symbol) {
+  clearSymbolError();
+  let response;
+  try {
+    response = await fetch(`/api/symbols/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+  } catch {
+    showSymbolError("移除失敗：無法連線到伺服器");
+    return;
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    showSymbolError(body.detail || `移除失敗（HTTP ${response.status}）`);
+    return;
+  }
+  delete state.snapshots[symbol];
+  state.symbols = body.symbols;
+  if (state.active === symbol) state.active = state.symbols[0] ?? null;   // 切到第一個
+  renderTabs();
+  render();
+}
+
+document.getElementById("addSymbolBtn").onclick = addSymbol;
+document.getElementById("newSymbol").onkeydown = event => {
+  if (event.key === "Enter") addSymbol();
+};
 
 // -- 行情健康度 ------------------------------------------------------------
 // 這是使用者判斷資料可不可信的唯一依據：實地發生過 Mac 睡眠、TCP 半開死亡，
@@ -429,6 +524,10 @@ function renderTabs() {
 function renderFeedStatus(feed) {
   if (!feed) return;
   state.feed = feed;
+  const usage = document.getElementById("subUsage");
+  if (usage && feed.subscription_limit != null) {
+    usage.textContent = `訂閱 ${feed.subscription_count}/${feed.subscription_limit}`;
+  }
   const el = document.getElementById("status");
   const ago = feed.last_message_ago;
   el.classList.remove("ok", "stale", "down");

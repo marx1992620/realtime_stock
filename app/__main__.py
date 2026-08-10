@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import functools
 import os
 import sys
 import threading
@@ -23,13 +24,31 @@ DEFAULT_LARGE_ORDER_LOTS = 10
 
 
 class Pipeline:
-    """把行情事件接到聚合器、寫檔器與廣播器。"""
+    """把行情事件接到聚合器、寫檔器與廣播器。
+
+    writers 這份字典從 Task 14 起會在執行中改變（新增／移除標的），而
+    handle_trade 在 Fugle SDK 的行情執行緒讀它，POST/DELETE /api/symbols
+    則在 FastAPI 的工作執行緒寫它——單純的 dict.get/[]=/pop 在 CPython 因
+    GIL 本身就是原子操作，不會讀到損毀的字典，但「建立/關閉 writer 再改
+    字典」是一個複合動作，用一把獨立的鎖把它與 handle_trade 的讀取序列化，
+    確保不會在 writer 已經 close() 到一半時被讀到。（append 在 writer 已關閉
+    後仍是安全的——storage.py 的 ParquetTradeWriter.append 會在關閉後只計數
+    不寫入——這把鎖只是不必依賴那道保護，讓行為更好推理。）
+    """
 
     def __init__(self, state: MarketState, broadcaster: Broadcaster,
-                 writers: dict[str, ParquetTradeWriter]) -> None:
+                 writers: dict[str, ParquetTradeWriter],
+                 output_dir: Path | None = None, date_str: str | None = None,
+                 run_id: str | None = None) -> None:
         self.state = state
         self.broadcaster = broadcaster
         self.writers = writers
+        # 動態新增的 writer 沿用同一次執行的輸出目錄／日期／run id，落在
+        # 同一個 run 底下；只有呼叫 add_writer 時才需要這三個。
+        self.output_dir = output_dir
+        self.date_str = date_str
+        self.run_id = run_id
+        self._writers_lock = threading.Lock()
 
     def handle_trade(self, trade: dict) -> None:
         # 走 MarketState 的加鎖寫入口：這個回呼在 Fugle SDK 的執行緒上，
@@ -37,7 +56,8 @@ class Pipeline:
         record = self.state.record_trade(trade)
         if record is None:            # 未追蹤代碼，或重複 serial
             return
-        writer = self.writers.get(record["symbol"])
+        with self._writers_lock:
+            writer = self.writers.get(record["symbol"])
         if writer is not None:
             writer.append(record)
         self.broadcaster.publish(record["symbol"])
@@ -46,8 +66,28 @@ class Pipeline:
         if self.state.record_book(book):
             self.broadcaster.publish(book["symbol"])
 
+    def add_writer(self, symbol: str) -> None:
+        """新增一檔的 writer。檔名沿用 Task 12 的 output_path 規則，run id
+        用啟動時那個——移除後再新增同一代碼會撞到同一個檔名，此時沿用
+        ParquetTradeWriter.flush 既有的 FileExistsError 保護讓它整個往上炸，
+        而不是靜默截斷；實務上盤中重複新增同代碼很少見，先不特別處理。"""
+        writer = ParquetTradeWriter(
+            output_path(self.output_dir, self.date_str, symbol, self.run_id))
+        with self._writers_lock:
+            self.writers[symbol] = writer
+
+    def remove_writer(self, symbol: str) -> None:
+        """關閉並移除一檔的 writer；務必先 close() 才能把緩衝中還沒滿一批
+        的成交寫出去，否則移除當下的資料會直接遺失。"""
+        with self._writers_lock:
+            writer = self.writers.pop(symbol, None)
+        if writer is not None:
+            writer.close()
+
     def close(self) -> None:
-        for writer in self.writers.values():
+        with self._writers_lock:
+            writers = list(self.writers.values())
+        for writer in writers:
             writer.close()
 
 
@@ -145,6 +185,28 @@ def fetch_names(api_key: str, symbols: list[str]) -> dict[str, str]:
     return names
 
 
+def lookup_symbol_name(api_key: str, symbol: str) -> str | None:
+    """給 POST /api/symbols 用：REST 查單一代碼的名稱。
+
+    與 fetch_names 不同的是這裡「查不到」要能被上層分辨出來並回 404——
+    盤中新增一檔打錯的代碼，比訂閱送出去才發現整天沒有資料好。REST 呼叫
+    本身失敗（含代碼不存在）或回應裡沒有 symbol 欄位都視為查不到，回傳
+    None 交由呼叫端判斷；名稱欄位是空字串仍算查到（代碼有效，只是沒有
+    名稱），回傳空字串。
+    """
+    try:
+        from fugle_marketdata import RestClient
+        client = RestClient(api_key=api_key)
+        quote = client.stock.intraday.quote(symbol=symbol) or {}
+    except Exception as error:                       # noqa: BLE001
+        print(f"查無 {symbol} 的行情資料：{type(error).__name__}: {error}",
+              file=sys.stderr, flush=True)
+        return None
+    if not quote.get("symbol"):
+        return None
+    return quote.get("name") or ""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python3 -m app", description="台股多檔即時大單追蹤")
@@ -212,7 +274,8 @@ def main(argv: list[str] | None = None) -> None:
                         names=names, book_symbols=args.with_book)
     broadcaster = Broadcaster()
     writers = build_writers(args.output_dir, today, args.symbols, run_id)
-    pipeline = Pipeline(state, broadcaster, writers)
+    pipeline = Pipeline(state, broadcaster, writers,
+                        output_dir=args.output_dir, date_str=today, run_id=run_id)
     feed = FugleFeed(api_key, args.symbols, pipeline.handle_trade,
                      pipeline.handle_book, include_trials=args.include_trials,
                      book_symbols=args.with_book)
@@ -230,9 +293,11 @@ def main(argv: list[str] | None = None) -> None:
           f"｜訂閱數 {len(args.symbols) + len(args.with_book)}/{MAX_SUBSCRIPTIONS}",
           flush=True)
     print(f"看盤畫面 http://{args.host}:{args.port}", flush=True)
+    app = create_app(state, broadcaster, feed, pipeline=pipeline,
+                     lookup_name=functools.partial(lookup_symbol_name, api_key),
+                     default_large_order_lots=DEFAULT_LARGE_ORDER_LOTS)
     try:
-        uvicorn.run(create_app(state, broadcaster, feed), host=args.host, port=args.port,
-                    log_level="warning")
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     except KeyboardInterrupt:
         pass
     finally:

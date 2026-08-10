@@ -286,6 +286,47 @@ class FugleFeed:
             if stock is not None:
                 stock.disconnect()
 
+    # -- 盤中動態增刪（Task 14 C）--------------------------------------------
+    def add_symbol(self, symbol: str, with_book: bool = False) -> None:
+        """在既有連線上訂閱一檔新代碼；不開第二條連線（一把 key 只能一條）。
+
+        先更新 self.symbols/self.book_symbols 再送訂閱：更新清單本身不需要
+        連線存在，即使目前正在重連中途（self._stock 是 None）也不會遺失
+        這個新代碼——下一次連線的 _subscribe_all 會用當下這份清單重新訂閱。
+        """
+        if symbol not in self.symbols:
+            self.symbols.append(symbol)
+        if with_book and symbol not in self.book_symbols:
+            self.book_symbols.append(symbol)
+        if self._stock is None:
+            return
+        self._stock.subscribe({"channel": "trades", "symbol": symbol})
+        if with_book:
+            self._stock.subscribe({"channel": "books", "symbol": symbol})
+
+    def remove_symbol(self, symbol: str) -> None:
+        """退訂一檔代碼（trades，若原本也訂了 books 則一併退），並從清單移除。
+
+        清單一移除，handle_message 的代碼過濾立刻生效（就算退訂的 REST/WS
+        呼叫本身失敗，之後進來的該代碼事件也不會再被送進聚合器），未來的
+        重連也不會再把它訂回來。
+        """
+        had_book = symbol in self.book_symbols
+        if symbol in self.symbols:
+            self.symbols.remove(symbol)
+        if had_book:
+            self.book_symbols.remove(symbol)
+        if self._stock is None:
+            return
+        self._stock.unsubscribe({"channel": "trades", "symbol": symbol})
+        if had_book:
+            self._stock.unsubscribe({"channel": "books", "symbol": symbol})
+
+    @property
+    def subscription_count(self) -> int:
+        """目前訂閱數（trades + books），供上層在新增前做預算檢查。"""
+        return len(self.symbols) + len(self.book_symbols)
+
     # -- 狀態可見（C）------------------------------------------------------
     def status(self) -> dict:
         """給 web 層與 UI 用的健康狀態快照。"""
