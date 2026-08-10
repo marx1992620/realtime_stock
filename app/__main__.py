@@ -218,7 +218,9 @@ def main(argv: list[str] | None = None) -> None:
                      book_symbols=args.with_book)
 
     # 一把 API key 只能開一條連線：確認沒有其他收集器在跑，否則會被伺服器
-    # 以 "Maximum number of connections reached" 斷線。
+    # 以 "Maximum number of connections reached" 斷線。feed.run() 自己會在
+    # 斷線後重連，這條執行緒的壽命等於整個程式的壽命，daemon=True 只是保險
+    # （正常關閉一律先呼叫 feed.stop()，見下方 finally）。
     threading.Thread(target=feed.run, daemon=True).start()
     labels = {s: f"{s} {names[s]}".strip() for s in args.symbols}
     thresholds = "、".join(f"{labels[s]} {args.large_order[s]}" for s in args.symbols)
@@ -229,11 +231,14 @@ def main(argv: list[str] | None = None) -> None:
           flush=True)
     print(f"看盤畫面 http://{args.host}:{args.port}", flush=True)
     try:
-        uvicorn.run(create_app(state, broadcaster), host=args.host, port=args.port,
+        uvicorn.run(create_app(state, broadcaster, feed), host=args.host, port=args.port,
                     log_level="warning")
     except KeyboardInterrupt:
         pass
     finally:
+        # 先停 feed 再關 writer：關閉順序反過來的話，重連迴圈或補資料還可能
+        # 在 writer.close() 之後繼續呼叫 handle_trade，寫進已經關閉的檔案。
+        feed.stop()
         pipeline.close()
         print("\n已停止，資料已寫入 " + str(args.output_dir), flush=True)
 

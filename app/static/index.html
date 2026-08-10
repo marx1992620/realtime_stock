@@ -15,6 +15,9 @@
     --axis: #b4b4b4;
     --surface: #ffffff;
     --line: #8884;
+    --ok: #1f8a3d;
+    --warn: #b3690a;
+    --bad: #c0392b;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -25,16 +28,21 @@
       --grid: #3a3a3a;
       --axis: #565656;
       --surface: #1b1b1b;
+      --ok: #3fbf67;
+      --warn: #e0a233;
+      --bad: #e0605a;
     }
   }
   /* 明確指定主題時要蓋過系統偏好，兩個方向都要能蓋。 */
   :root[data-theme="dark"] {
     --buy: #e66767; --sell: #008300; --ink: #e9e9e9; --muted-ink: #9d9d9d;
     --grid: #3a3a3a; --axis: #565656; --surface: #1b1b1b;
+    --ok: #3fbf67; --warn: #e0a233; --bad: #e0605a;
   }
   :root[data-theme="light"] {
     --buy: #e34948; --sell: #008300; --ink: #1c1c1c; --muted-ink: #6b6b6b;
     --grid: #dcdcdc; --axis: #b4b4b4; --surface: #ffffff;
+    --ok: #1f8a3d; --warn: #b3690a; --bad: #c0392b;
   }
 
   body { font: 14px/1.5 -apple-system, "PingFang TC", sans-serif; margin: 1rem;
@@ -57,6 +65,18 @@
   .scroll { max-height: 320px; overflow-y: auto; }
   .price { font-size: 1.6rem; font-weight: 700; }
   .muted { color: var(--muted-ink); font-size: .85em; }
+
+  /* -- 行情健康度：使用者判斷資料可不可信的唯一依據，故意做得比其他
+     muted 文字醒目一點（實線字色 + 圓點），不要淹沒在版面裡。 */
+  #status { display: inline-flex; align-items: center; gap: .4rem;
+            font-size: .9em; font-weight: 600; }
+  #status .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  #status.ok { color: var(--ok); }
+  #status.ok .dot { background: var(--ok); }
+  #status.stale { color: var(--warn); }
+  #status.stale .dot { background: var(--warn); }
+  #status.down { color: var(--bad); }
+  #status.down .dot { background: var(--bad); }
 
   /* -- 大單流向圖 -- */
   .legend { display: flex; gap: 1rem; align-items: center; margin-bottom: .3rem; }
@@ -93,14 +113,14 @@
 <header>
   <strong>台股即時大單追蹤</strong>
   <div class="tabs" id="tabs"></div>
-  <span id="status" class="muted">連線中…</span>
+  <span id="status"><i class="dot"></i>連線中…</span>
 </header>
 
 <div class="grid" id="panels"></div>
 <div id="tip" hidden></div>
 
 <script>
-const state = { snapshots: {}, symbols: [], active: null };
+const state = { snapshots: {}, symbols: [], active: null, feed: null };
 const fmt = n => (n ?? 0).toLocaleString("zh-TW");
 const money = n => (n ?? 0).toLocaleString("zh-TW", { maximumFractionDigits: 0 });
 const clock = us => us ? new Date(us / 1000).toLocaleTimeString("zh-TW", { hour12: false }) : "—";
@@ -400,12 +420,57 @@ function renderTabs() {
     el.onclick = () => { state.active = el.dataset.symbol; renderTabs(); render(); });
 }
 
+// -- 行情健康度 ------------------------------------------------------------
+// 這是使用者判斷資料可不可信的唯一依據：實地發生過 Mac 睡眠、TCP 半開死亡，
+// 畫面卻照樣顯示「已連線」，唯一症狀是時間戳凍住。這裡刻意不只靠 ws 推播
+// 更新這個狀態——行情真的斷線時，恰好就是不會再有 trade/book 觸發推播的
+// 時候，只依賴 ws 訊息會讓這個指標在最需要的時候跟著一起凍住。所以另外
+// 用一個獨立的輪詢，直接問伺服器 GET /api/feed。
+function renderFeedStatus(feed) {
+  if (!feed) return;
+  state.feed = feed;
+  const el = document.getElementById("status");
+  const ago = feed.last_message_ago;
+  el.classList.remove("ok", "stale", "down");
+  if (feed.state === "connected" && ago !== null && ago <= 60) {
+    el.classList.add("ok");
+    el.innerHTML = `<i class="dot"></i>行情正常（最後更新 ${Math.round(ago)} 秒前）`;
+  } else if (feed.state === "connected") {
+    el.classList.add("stale");
+    const secs = ago !== null ? Math.round(ago) : "?";
+    el.innerHTML = `<i class="dot"></i>行情停滯 ${secs} 秒`;
+  } else if (feed.state === "reconnecting") {
+    el.classList.add("down");
+    el.innerHTML = feed.reconnects > 0
+      ? `<i class="dot"></i>重新連線中（第 ${feed.reconnects} 次）`
+      : `<i class="dot"></i>連線中…`;
+  } else {
+    el.classList.add("down");
+    el.innerHTML = `<i class="dot"></i>行情已停止`;
+  }
+}
+
+async function pollFeedStatus() {
+  try {
+    const response = await fetch("/api/feed");
+    if (response.ok) renderFeedStatus(await response.json());
+  } catch {
+    // 網路暫時打嗝：維持上一次已知的狀態，下一輪輪詢再試。
+  }
+}
+pollFeedStatus();
+setInterval(pollFeedStatus, 5000);
+
 // 由頁面協定推導 ws/wss：寫死 ws:// 時，只要頁面經 HTTPS 提供（例如放在
 // TLS 反向代理後），瀏覽器會以混合內容為由封鎖連線，整個畫面卡在「連線中…」。
 const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
 const ws = new WebSocket(`${wsScheme}//${location.host}/ws`);
-ws.onopen = () => document.getElementById("status").textContent = "已連線";
-ws.onclose = () => document.getElementById("status").textContent = "已斷線，請重整頁面";
+ws.onclose = () => {
+  const el = document.getElementById("status");
+  el.classList.remove("ok", "stale");
+  el.classList.add("down");
+  el.innerHTML = `<i class="dot"></i>瀏覽器已斷線，請重整頁面`;
+};
 ws.onmessage = event => {
   const msg = JSON.parse(event.data);
   if (msg.type === "init") {
@@ -414,8 +479,10 @@ ws.onmessage = event => {
     state.active = state.active ?? state.symbols[0];
     // 門檻不另存：每檔快照都帶自己的 large_order_lots，面板直接讀那個。
     renderTabs();
+    renderFeedStatus(msg.feed);
   } else if (msg.type === "update") {
     state.snapshots[msg.snapshot.symbol] = msg.snapshot;
+    renderFeedStatus(msg.feed);
     if (msg.snapshot.symbol !== state.active) return;
   }
   render();

@@ -141,6 +141,44 @@ class RecordingBroadcaster(Broadcaster):
         super().publish(symbol)
 
 
+# -- 行情健康度（Task 13 C）-------------------------------------------------
+#
+# 無聲失敗比失敗本身更糟：feed 傳進 create_app 之後，GET /api/feed 與 ws 的
+# init／update 訊息都要能問到目前的連線健康度，不必再靠「時間戳有沒有動」
+# 這種脆弱訊號去猜資料還新不新鮮。
+
+
+class FakeFeed:
+    def __init__(self, state="connected", reconnects=0, last_message_ago=1.5):
+        self._payload = {"state": state, "last_message_ago": last_message_ago,
+                         "reconnects": reconnects, "subscription_errors": []}
+
+    def status(self) -> dict:
+        return dict(self._payload)
+
+
+def test_feed_status_is_exposed_via_rest_and_ws_messages():
+    state = MarketState(["2330"], large_order_lots=5)
+    feed = FakeFeed(state="reconnecting", reconnects=2)
+    client = TestClient(create_app(state, Broadcaster(), feed))
+
+    body = client.get("/api/feed").json()
+    assert body == {"state": "reconnecting", "last_message_ago": 1.5,
+                    "reconnects": 2, "subscription_errors": []}
+
+    with client.websocket_connect("/ws") as ws:
+        first = ws.receive_json()
+    assert first["feed"]["state"] == "reconnecting"
+    assert first["feed"]["reconnects"] == 2
+
+
+def test_feed_status_defaults_to_stopped_when_no_feed_given():
+    """create_app 的 feed 參數是選配的（許多測試不需要真的接一個 FugleFeed
+    進來）；沒給時 /api/feed 仍要回一個合理的預設值，不是少個欄位或整個 500。"""
+    _, client = build()
+    assert client.get("/api/feed").json()["state"] == "stopped"
+
+
 def test_websocket_init_carries_every_threshold():
     state = MarketState(["2330", "2317"],
                         large_order_lots={"2330": 20, "2317": 3})

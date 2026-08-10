@@ -155,7 +155,19 @@ class MarketState:
             return {s: a.snapshot() for s, a in self._aggregators.items()}
 
 
-def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
+def _feed_status(feed) -> dict:
+    """feed 是選配的（測試常常不需要真的接一個 FugleFeed 進來）；
+
+    沒有 feed 時回一個「未連線」的預設值，而不是讓 /api/feed 或 ws 訊息
+    整個少一個欄位——前端不必為兩種形狀各寫一份分支。
+    """
+    if feed is None:
+        return {"state": "stopped", "last_message_ago": None,
+                "reconnects": 0, "subscription_errors": []}
+    return feed.status()
+
+
+def create_app(state: MarketState, broadcaster: Broadcaster, feed=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 廣播器要在事件迴圈起來後才能綁定。使用 lifespan 而非
@@ -178,6 +190,10 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
     @app.get("/api/symbols")
     def symbols() -> dict:
         return {"symbols": state.symbols, "thresholds": state.thresholds}
+
+    @app.get("/api/feed")
+    def feed_status() -> dict:
+        return _feed_status(feed)
 
     @app.get("/api/snapshot/{symbol}")
     def snapshot(symbol: str) -> dict:
@@ -208,8 +224,10 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
         # 因此把等待丟到工作執行緒。同步 def 路由本來就跑在工作執行緒上。
         snapshots, thresholds = await asyncio.to_thread(
             lambda: (state.snapshot_all(), state.thresholds))
+        # feed.status() 不碰 MarketState 的鎖，只讀幾個屬性，不必 to_thread。
         await websocket.send_json({"type": "init", "snapshots": snapshots,
-                                   "thresholds": thresholds})
+                                   "thresholds": thresholds,
+                                   "feed": _feed_status(feed)})
         queue = broadcaster.subscribe()
         try:
             while True:
@@ -255,7 +273,8 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
                     for name in pending_symbols:
                         snapshot = await asyncio.to_thread(state.snapshot, name)
                         await websocket.send_json({"type": "update",
-                                                   "snapshot": snapshot})
+                                                   "snapshot": snapshot,
+                                                   "feed": _feed_status(feed)})
 
                 if disconnected:
                     break
