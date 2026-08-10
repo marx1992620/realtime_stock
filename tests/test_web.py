@@ -362,3 +362,116 @@ def test_threshold_change_is_correct_under_concurrent_ingest():
     # 桶在同一把鎖下與大單階梯一起重算，同樣不得重複計數
     assert sum(b["buy_lots"] + b["sell_lots"] for b in snapshot["buckets"]) == \
         sum(t["lots"] for t in large)
+
+
+# -- /ws 的關閉中斷（C） ----------------------------------------------------
+#
+# 這裡刻意不用 TestClient.websocket_connect：它在背景執行緒的 anyio portal
+# 上跑，結束連線時是「送 disconnect 訊息、幾乎同時 cancel 整個 scope」，時序
+# 不受測試控制。直接手刻 ASGI receive/send 佇列，才能精準卡在「連線已訂閱、
+# 但 disconnect 訊息還沒送達」這個時間點來斷言。
+
+def _drive_ws_app(app):
+    """手動握手一個 /ws 連線，回傳 (task, incoming, sent)。
+
+    incoming 是我們餵給 app 的 ASGI 訊息佇列（app 呼叫 websocket.receive()
+    時會從這裡拿）；sent 收集 app 送出的每一則 ASGI 訊息。
+    """
+    incoming: asyncio.Queue = asyncio.Queue()
+    sent: list[dict] = []
+
+    async def receive():
+        return await incoming.get()
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "websocket", "path": "/ws", "raw_path": b"/ws", "root_path": "",
+        "scheme": "ws", "query_string": b"", "headers": [],
+        "client": ("test", 1234), "server": ("test", 80),
+        "subprotocols": [], "state": {}, "extensions": {},
+    }
+    task = asyncio.ensure_future(app(scope, receive, send))
+    return task, incoming, sent
+
+
+async def _handshake(incoming, sent):
+    """送出 websocket.connect 並等到 accept + init 快照都送出。"""
+    await incoming.put({"type": "websocket.connect"})
+    for _ in range(200):
+        if len(sent) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    assert sent and sent[0]["type"] == "websocket.accept", "應先完成 accept 交握"
+    assert len(sent) >= 2, "accept 之後應立即送出 init 快照"
+
+
+def test_ws_ends_and_unsubscribes_when_client_disconnects():
+    """實測缺陷：stream 只送不收，永遠卡在 await queue.get()，瀏覽器行情安靜
+    時 uvicorn 的優雅關閉（透過送 websocket.disconnect 訊息）永遠等不到協程
+    結束，只能 SIGKILL，finally 沒跑、緩衝區的成交全部遺失。
+
+    這裡直接送一則 disconnect 訊息（不透過 queue）：舊代碼從不呼叫
+    websocket.receive()，看不到這則訊息，協程會一直卡著，下面的
+    asyncio.wait_for 會逾時而讓測試失敗——精確重現這個缺陷。
+    """
+    state = MarketState(["2330"], large_order_lots=5)
+    broadcaster = Broadcaster()
+    app = create_app(state, broadcaster)
+
+    async def scenario():
+        broadcaster.bind_loop(asyncio.get_running_loop())
+        task, incoming, sent = _drive_ws_app(app)
+        await _handshake(incoming, sent)
+        assert len(broadcaster._queues) == 1, "交握完成後應已訂閱"
+
+        await incoming.put({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(task, timeout=2)   # 舊代碼會在這裡逾時
+        assert broadcaster._queues == set(), "斷線後訂閱必須被移除"
+
+    asyncio.run(scenario())
+
+
+def test_ws_still_delivers_a_pending_update_when_it_races_the_disconnect():
+    """queue.get() 與 websocket.receive() 用 asyncio.wait(FIRST_COMPLETED) 同時
+    等待；即使兩者剛好同一輪都完成，已經從佇列取出的更新也不能被默默丟掉。"""
+    state = MarketState(["2330"], large_order_lots=5)
+    broadcaster = Broadcaster()
+    app = create_app(state, broadcaster)
+
+    async def scenario():
+        broadcaster.bind_loop(asyncio.get_running_loop())
+        task, incoming, sent = _drive_ws_app(app)
+        await _handshake(incoming, sent)
+
+        broadcaster.publish("2330")
+        await incoming.put({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(task, timeout=2)
+
+        kinds = [m.get("type") for m in sent]
+        assert kinds.count("websocket.send") >= 2, "更新快照不能因為同時斷線就被丟掉"
+
+    asyncio.run(scenario())
+
+
+def test_ws_cancellation_still_unsubscribes_without_leaking_tasks():
+    """伺服器關閉時協程可能直接被 cancel（而非先收到 disconnect 訊息）。
+    asyncio.wait 被取消不會連帶取消傳入的 get_task／recv_task，沒有明確處理
+    就會每個 tick 洩漏一個 task；同時 finally 的 unsubscribe 仍必須執行。"""
+    state = MarketState(["2330"], large_order_lots=5)
+    broadcaster = Broadcaster()
+    app = create_app(state, broadcaster)
+
+    async def scenario():
+        broadcaster.bind_loop(asyncio.get_running_loop())
+        task, incoming, sent = _drive_ws_app(app)
+        await _handshake(incoming, sent)
+        assert len(broadcaster._queues) == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert broadcaster._queues == set(), "cancel 後也必須移除訂閱"
+
+    asyncio.run(scenario())

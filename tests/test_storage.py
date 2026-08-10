@@ -165,5 +165,38 @@ def test_closed_flag_is_set_before_flush_can_raise(tmp_path):
 
 
 def test_output_path_layout(tmp_path):
-    path = output_path(tmp_path, "2026-08-05", "trades", "2330")
-    assert path == tmp_path / "2026-08-05" / "trades_2330.parquet"
+    """A：每次執行、每個代碼各自一個檔案，路徑帶 run id 才不會同一天重跑互相覆寫。"""
+    path = output_path(tmp_path, "2026-08-05", "2330", "093000")
+    assert path == tmp_path / "2026-08-05" / "2330" / "093000.parquet"
+
+
+def test_flush_raises_if_target_file_already_exists(tmp_path):
+    """A 的最後一道防線：run id 正常不會碰撞，但萬一撞了，flush() 首次建檔前
+    必須拒絕覆寫既有檔案，而不是靜默截斷（實測 5 列變 2 列）。"""
+    path = tmp_path / "trades.parquet"
+    path.write_bytes(b"pretend this is yesterday's finished parquet file")
+    writer = ParquetTradeWriter(path, batch_size=1)
+    with pytest.raises(FileExistsError):
+        writer.append(RECORD)
+
+
+def test_flush_interval_seconds_zero_flushes_on_first_append(tmp_path):
+    """D：即使關閉流程正確，batch_size=500 仍可能損失最多 500 筆。
+    flush_interval_seconds=0 時，逾時判斷必須立即成立，第一筆 append 就寫出，
+    不必等到湊滿批次。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path, batch_size=100, flush_interval_seconds=0)
+    writer.append(RECORD)
+    assert path.exists(), "flush_interval_seconds=0 應在第一筆 append 就觸發寫出"
+    assert writer._buffer == [], "第一筆就該被 flush 出去，緩衝區應已清空"
+    writer.close()
+    assert pq.read_table(path).num_rows == 1
+
+
+def test_flush_interval_does_not_trigger_early_with_default(tmp_path):
+    """既有的批次量測試不可被逾時判斷破壞：預設 30 秒的視窗內不該提早寫出。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path, batch_size=100)
+    writer.append(RECORD)
+    assert not path.exists(), "未逾時、未達批次量不應寫檔"
+    writer.close()

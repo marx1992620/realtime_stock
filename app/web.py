@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -212,16 +213,52 @@ def create_app(state: MarketState, broadcaster: Broadcaster) -> FastAPI:
         queue = broadcaster.subscribe()
         try:
             while True:
-                symbol = await queue.get()
-                # 合併間隔內的重複通知，避免逐事件推送
-                await asyncio.sleep(PUSH_INTERVAL_SECONDS)
-                pending = {symbol}
-                while not queue.empty():
-                    pending.add(queue.get_nowait())
-                for name in pending:
-                    snapshot = await asyncio.to_thread(state.snapshot, name)
-                    await websocket.send_json({"type": "update",
-                                               "snapshot": snapshot})
+                # 只送不收就永遠看不到客戶端斷線、也看不到伺服器關機時
+                # uvicorn 送進來的 disconnect 訊息，優雅關閉只能乾等
+                # （實測 Ctrl-C／SIGTERM 都停不掉，只能 SIGKILL，
+                # finally 沒跑，緩衝區裡的成交全部遺失）。同時等佇列與
+                # 收訊息，任一完成就繼續。
+                get_task = asyncio.ensure_future(queue.get())
+                recv_task = asyncio.ensure_future(websocket.receive())
+                try:
+                    done, pending = await asyncio.wait(
+                        {get_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
+                except asyncio.CancelledError:
+                    # 伺服器可能直接 cancel 這個協程，而不是先送 disconnect
+                    # 訊息。asyncio.wait 被取消不會連帶取消傳進去的 task，
+                    # 不清掉這兩個就會每個 tick 洩漏一個。
+                    get_task.cancel()
+                    recv_task.cancel()
+                    for leftover in (get_task, recv_task):
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await leftover
+                    raise
+
+                for leftover in pending:                  # 取消沒完成的那一個
+                    leftover.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await leftover
+
+                disconnected = False
+                if recv_task in done:
+                    message = recv_task.result()
+                    if message["type"] == "websocket.disconnect":
+                        disconnected = True
+
+                if get_task in done:
+                    symbol = get_task.result()
+                    # 合併間隔內的重複通知，避免逐事件推送
+                    await asyncio.sleep(PUSH_INTERVAL_SECONDS)
+                    pending_symbols = {symbol}
+                    while not queue.empty():
+                        pending_symbols.add(queue.get_nowait())
+                    for name in pending_symbols:
+                        snapshot = await asyncio.to_thread(state.snapshot, name)
+                        await websocket.send_json({"type": "update",
+                                                   "snapshot": snapshot})
+
+                if disconnected:
+                    break
         except WebSocketDisconnect:
             pass
         finally:

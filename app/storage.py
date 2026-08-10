@@ -7,6 +7,7 @@ batch_size 才寫一個 row group；close() 會把未滿的批次補寫出去。
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pyarrow as pa
@@ -27,18 +28,30 @@ TRADE_SCHEMA = pa.schema([
 ])
 
 
-def output_path(base_dir: Path, date_str: str, kind: str, symbol: str) -> Path:
-    return Path(base_dir) / date_str / f"{kind}_{symbol}.parquet"
+def output_path(base_dir: Path, date_str: str, symbol: str, run_id: str) -> Path:
+    """每次執行、每個代碼各自一個檔案：data/<日期>/<代碼>/<run_id>.parquet。
+
+    run_id 是程式啟動時間（同一次執行的所有代碼共用），這樣同一天重跑第二次
+    不會撞上第一次的檔名——舊版檔名固定，pq.ParquetWriter 開檔即截斷，
+    實測重跑一次就讓 5 列資料變 2 列，且沒有任何警告。
+    """
+    return Path(base_dir) / date_str / symbol / f"{run_id}.parquet"
 
 
 class ParquetTradeWriter:
-    def __init__(self, path: Path, batch_size: int = 500) -> None:
+    def __init__(self, path: Path, batch_size: int = 500,
+                 flush_interval_seconds: float = 30.0) -> None:
         self.path = Path(path)
         self.batch_size = batch_size
+        # 即使關閉流程完全正確，batch_size 仍設下了「意外終止最多損失這麼多
+        # 筆」的上限；用牆上時間也會補這個洞，但重開機、時區變動都可能讓它
+        # 走樣，用不受這些影響的單調時鐘。
+        self.flush_interval_seconds = flush_interval_seconds
         self.dropped_after_close = 0
         self._buffer: list[dict] = []
         self._writer: pq.ParquetWriter | None = None
         self._closed = False
+        self._last_flush = time.monotonic()
 
     def __enter__(self) -> "ParquetTradeWriter":
         return self
@@ -65,13 +78,22 @@ class ParquetTradeWriter:
                       "(feed thread is still running)", file=sys.stderr, flush=True)
             return
         self._buffer.append({name: record.get(name) for name in TRADE_SCHEMA.names})
-        if len(self._buffer) >= self.batch_size:
+        overdue = (time.monotonic() - self._last_flush) >= self.flush_interval_seconds
+        if len(self._buffer) >= self.batch_size or overdue:
             self.flush()
 
     def flush(self) -> None:
+        # 每次呼叫都重置逾時的起算點，不論這次真的有沒有東西可寫——空緩衝區
+        # 沒有資料可損失，沒有理由讓下一筆 append 立刻又觸發一次逾時判斷。
+        self._last_flush = time.monotonic()
         if not self._buffer:
             return
         if self._writer is None:
+            if self.path.exists():
+                # 最後一道防線：正常情況下 run id 不會碰撞，但萬一撞上，
+                # 寧可整批拋出讓上層看見，也不能靜默截斷已經寫完的檔案。
+                raise FileExistsError(
+                    f"{self.path} already exists; refusing to overwrite it")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._writer = pq.ParquetWriter(self.path, TRADE_SCHEMA)
         try:

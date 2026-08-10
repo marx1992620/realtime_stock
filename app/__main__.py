@@ -51,6 +51,17 @@ class Pipeline:
             writer.close()
 
 
+def build_writers(output_dir: Path, date_str: str, symbols: list[str],
+                   run_id: str) -> dict[str, ParquetTradeWriter]:
+    """每個代碼一個 writer，共用同一個 run id，落在各自的
+    data/<date>/<symbol>/<run_id>.parquet —— 同一天重跑一次會是新的 run id、
+    新的檔案，不會撞上前一次執行留下的資料。"""
+    return {
+        symbol: ParquetTradeWriter(output_path(output_dir, date_str, symbol, run_id))
+        for symbol in symbols
+    }
+
+
 def _symbol_list(raw: str) -> list[str]:
     symbols = [s.strip() for s in raw.split(",") if s.strip()]
     if not symbols:
@@ -192,15 +203,15 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("FUGLE_API_KEY is not set. Copy .env.example to .env and add your API key.")
 
     today = datetime.date.today().isoformat()
+    # 同一次執行的所有代碼共用一個 run id，方便事後從檔名辨識同一輪；同一天
+    # 重跑會拿到新的 run id，落在新的檔案，不會覆寫前一次執行的資料。
+    run_id = datetime.datetime.now().strftime("%H%M%S")
     # REST 取名不佔 WebSocket 的訂閱預算，開連線前先問完。
     names = fetch_names(api_key, args.symbols)
     state = MarketState(args.symbols, large_order_lots=args.large_order,
                         names=names, book_symbols=args.with_book)
     broadcaster = Broadcaster()
-    writers = {
-        symbol: ParquetTradeWriter(output_path(args.output_dir, today, "trades", symbol))
-        for symbol in args.symbols
-    }
+    writers = build_writers(args.output_dir, today, args.symbols, run_id)
     pipeline = Pipeline(state, broadcaster, writers)
     feed = FugleFeed(api_key, args.symbols, pipeline.handle_trade,
                      pipeline.handle_book, include_trials=args.include_trials,

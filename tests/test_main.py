@@ -4,7 +4,8 @@ import types
 import pyarrow.parquet as pq
 import pytest
 
-from app.__main__ import MAX_SUBSCRIPTIONS, Pipeline, fetch_names, parse_args
+from app.__main__ import (MAX_SUBSCRIPTIONS, Pipeline, build_writers, fetch_names,
+                          parse_args)
 from app.storage import ParquetTradeWriter
 from app.web import Broadcaster, MarketState
 
@@ -219,3 +220,28 @@ def test_pipeline_ignores_untracked_symbol(tmp_path):
     pipeline.handle_trade({**AT_ASK, "symbol": "9999"})   # 不可拋出
     pipeline.close()
     assert not (tmp_path / "trades_9999.parquet").exists()
+
+
+# -- 每次執行獨立檔案（A）---------------------------------------------------
+
+PARQUET_RECORD = {"symbol": "2330", "serial": 1, "time": 100, "price": 2405.0,
+                  "lots": 2, "shares": 2000, "side": "buy", "value_twd": 4_810_000.0}
+
+
+def test_build_writers_uses_run_id_to_avoid_same_day_collisions(tmp_path):
+    """實測缺陷：檔名固定為 data/<日期>/trades_<代碼>.parquet，同一天重跑第二次
+    時 pq.ParquetWriter 開檔即截斷，第一次的資料直接消失（實測 5 列變 2 列）。
+    main() 啟動時應各自帶一個 run id，讓同一天的兩次執行落在不同檔案，
+    彼此不得互相覆寫。"""
+    first = build_writers(tmp_path, "2026-08-07", ["2330"], "090000")
+    first["2330"].append(PARQUET_RECORD)
+    first["2330"].append({**PARQUET_RECORD, "serial": 2})
+    first["2330"].close()
+
+    second = build_writers(tmp_path, "2026-08-07", ["2330"], "140000")
+    assert second["2330"].path != first["2330"].path, "不同 run id 必須落在不同檔案"
+    second["2330"].append({**PARQUET_RECORD, "serial": 100})
+    second["2330"].close()
+
+    assert pq.read_table(first["2330"].path).num_rows == 2, "前一次執行的資料不得被更動"
+    assert pq.read_table(second["2330"].path).num_rows == 1
