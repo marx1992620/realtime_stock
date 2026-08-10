@@ -1,11 +1,12 @@
 """Parquet 緩衝寫入。
 
 逐筆成交量大（單日單檔實測逾 1 萬筆），逐筆開檔寫入成本過高，因此累積到
-batch_size 才寫一個 row group；close() 會把未滿的批次補寫出去。
+row_group_size 才寫一個 row group；close() 會把未滿的批次補寫出去。
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,13 +41,26 @@ def output_path(base_dir: Path, date_str: str, symbol: str, run_id: str) -> Path
 
 class ParquetTradeWriter:
     def __init__(self, path: Path, batch_size: int = 500,
-                 flush_interval_seconds: float = 30.0) -> None:
+                 flush_interval_seconds: float = 300.0,
+                 row_group_size: int = 2000) -> None:
         self.path = Path(path)
+        # 實際寫入的是這個暫存檔；close() 成功寫完 footer 之後才 os.replace
+        # 成 self.path。os.replace 在同一檔案系統上是原子操作，所以
+        # self.path 要嘛不存在、要嘛是完整可讀的檔案 —— 讀取端不會看到
+        # 「開了頭但沒有 footer」的殘檔。
+        self.partial_path = self.path.with_name(self.path.name + ".partial")
         self.batch_size = batch_size
-        # 即使關閉流程完全正確，batch_size 仍設下了「意外終止最多損失這麼多
-        # 筆」的上限；用牆上時間也會補這個洞，但重開機、時區變動都可能讓它
-        # 走樣，用不受這些影響的單調時鐘。
+        # 意外終止最多損失多少緩衝資料的上限。batch_size 曾經同時扮演這個
+        # 角色，但把持久化頻率跟 row_group_size 解耦之後，buffer 可能遠遠
+        # 超過 batch_size 都還沒真的落地，所以損失上限改由這個逾時獨立把關
+        # ——不管 buffer 多大，逾時就強制寫出一個 row group（寧可碎片化，
+        # 也不要讓資料無界地留在記憶體）。用單調時鐘，不受重開機、時區影響。
         self.flush_interval_seconds = flush_interval_seconds
+        # 一個 row group 至少要湊到這麼多列才真正呼叫 write_table，避免
+        # 「30 秒逾時 flush」把 190KB 的檔案切成 102 個、每組 5～11 列的
+        # row group（讀取效率很差）。逾時強制寫出時可能達不到這個數字，
+        # 那是刻意的取捨：資料安全優先於檔案結構。
+        self.row_group_size = row_group_size
         self.dropped_after_close = 0
         self._buffer: list[dict] = []
         self._writer: pq.ParquetWriter | None = None
@@ -79,23 +93,37 @@ class ParquetTradeWriter:
             return
         self._buffer.append({name: record.get(name) for name in TRADE_SCHEMA.names})
         overdue = (time.monotonic() - self._last_flush) >= self.flush_interval_seconds
-        if len(self._buffer) >= self.batch_size or overdue:
+        if overdue:
+            # 逾時且緩衝有資料：不管有沒有到 row_group_size，寧可寫出一個
+            # 較碎的 row group，也不要讓資料的損失上限失去意義。
+            self._write_row_group()
+        elif len(self._buffer) >= self.batch_size:
             self.flush()
 
     def flush(self) -> None:
-        # 每次呼叫都重置逾時的起算點，不論這次真的有沒有東西可寫——空緩衝區
-        # 沒有資料可損失，沒有理由讓下一筆 append 立刻又觸發一次逾時判斷。
+        """批次量觸發的一般 flush：只有累積到 row_group_size 才真正落地成一個
+        row group；未達門檻就先留在記憶體，讓下一次 flush 或逾時再檢查——
+        這是持久化頻率跟 row group 大小解耦的地方。"""
+        if len(self._buffer) >= self.row_group_size:
+            self._write_row_group()
+
+    def _write_row_group(self) -> None:
+        # 只有真的嘗試寫出（或確認沒東西可寫）才重置逾時起算點。flush() 因為
+        # 未達 row_group_size 而沒寫的那些呼叫不算數 —— 否則批次量觸發的
+        # flush() 會不斷把逾時的時鐘往後推，讓「最多損失
+        # flush_interval_seconds 秒」的承諾失去意義。
         self._last_flush = time.monotonic()
         if not self._buffer:
             return
         if self._writer is None:
-            if self.path.exists():
+            if self.path.exists() or self.partial_path.exists():
                 # 最後一道防線：正常情況下 run id 不會碰撞，但萬一撞上，
                 # 寧可整批拋出讓上層看見，也不能靜默截斷已經寫完的檔案。
                 raise FileExistsError(
-                    f"{self.path} already exists; refusing to overwrite it")
+                    f"{self.path} (or {self.partial_path.name}) already exists; "
+                    "refusing to overwrite it")
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._writer = pq.ParquetWriter(self.path, TRADE_SCHEMA)
+            self._writer = pq.ParquetWriter(self.partial_path, TRADE_SCHEMA)
         try:
             self._writer.write_table(
                 pa.Table.from_pylist(self._buffer, schema=TRADE_SCHEMA))
@@ -110,10 +138,22 @@ class ParquetTradeWriter:
 
     def close(self) -> None:
         self._closed = True
-        self.flush()
+        self._write_row_group()          # close 一律寫出剩餘資料
         if self._writer is not None:
-            self._writer.close()
-            self._writer = None
+            writer, self._writer = self._writer, None
+            try:
+                writer.close()            # 寫 footer；中途被中斷會拋例外
+            except Exception as error:
+                # footer 沒寫完，.partial 沒有索引無法讀取。留著它（不改名成
+                # self.path），讓讀取端天然忽略——但必須讓人知道發生過這件事。
+                print(f"{self.partial_path}: writer.close() failed while "
+                      f"writing the footer, file left as {self.partial_path.name} "
+                      f"and is likely unreadable: {type(error).__name__}: {error}",
+                      file=sys.stderr, flush=True)
+                raise
+            # footer 寫完才代表 .partial 是完整可讀的檔案；os.replace 在同一
+            # 檔案系統上是原子操作，self.path 不會出現「半寫」的中間狀態。
+            os.replace(self.partial_path, self.path)
         if self.dropped_after_close:
             print(f"{self.path}: dropped {self.dropped_after_close} record(s) "
                   "appended after close", file=sys.stderr, flush=True)

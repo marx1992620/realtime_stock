@@ -42,15 +42,20 @@ def test_auction_trade_without_serial_is_written(tmp_path):
     assert row["lots"] == 2024
 
 
-def test_records_are_buffered_until_batch_size(tmp_path):
+def test_records_are_buffered_until_row_group_size(tmp_path):
+    """B：持久化頻率（batch_size 觸發 flush() 的次數）跟 row group 大小
+    （row_group_size）解耦——湊到 batch_size 只是「檢查一次」，未達
+    row_group_size 就仍留在記憶體，不產生 row group。"""
     path = tmp_path / "trades.parquet"
-    writer = ParquetTradeWriter(path, batch_size=3)
+    writer = ParquetTradeWriter(path, batch_size=3, row_group_size=3)
     writer.append(RECORD)
     writer.append(RECORD)
-    assert not path.exists(), "未達批次量不應寫檔"
+    assert not writer.partial_path.exists(), "未達 row_group_size 不應寫出"
     writer.append(RECORD)
-    assert path.exists(), "達到批次量應寫出"
+    assert writer.partial_path.exists(), "達到 row_group_size 應寫出一個 row group"
+    assert not path.exists(), "A：改名成正式檔要等 close() 成功寫完 footer"
     writer.close()
+    assert not writer.partial_path.exists()
     assert pq.read_table(path).num_rows == 3
 
 
@@ -123,7 +128,7 @@ def test_records_dropped_after_close_are_announced(tmp_path, capsys):
 def test_failed_flush_loses_only_that_batch(tmp_path, capsys):
     """毒化的緩衝區若留著，之後每次 flush 都會再拋一次，整日不再落檔。"""
     path = tmp_path / "trades.parquet"
-    writer = ParquetTradeWriter(path, batch_size=1)
+    writer = ParquetTradeWriter(path, batch_size=1, row_group_size=1)
     writer.append(RECORD)                              # 開檔，正常寫入
 
     original = writer._writer.write_table
@@ -140,18 +145,18 @@ def test_failed_flush_loses_only_that_batch(tmp_path, capsys):
 
 
 def test_closed_flag_is_set_before_flush_can_raise(tmp_path):
-    """close() 目前是 flush() -> writer.close() -> self._closed = True。
-    flush() 或 writer.close() 任一失敗都會讓 _closed 永遠設不到，daemon
-    行情執行緒仍可能通過關檔後的 append 護欄，湊滿批次時重開同路徑的
-    ParquetWriter，把已經寫完的檔案截斷成殘骸。_closed 必須是 close() 的
-    第一步，不管後面是否拋出。"""
+    """close() 目前是 _write_row_group() -> writer.close() -> self._closed
+    在最前面就設定。_write_row_group() 或 writer.close() 任一失敗都不能讓
+    _closed 設不到，否則 daemon 行情執行緒仍可能通過關檔後的 append 護欄，
+    湊滿批次時重開同路徑的 ParquetWriter，把已經寫完的檔案截斷成殘骸。
+    _closed 必須是 close() 的第一步，不管後面是否拋出。"""
     path = tmp_path / "trades.parquet"
     writer = ParquetTradeWriter(path, batch_size=100)   # 不會自動觸發 flush
     writer.append(RECORD)
 
     def boom():
-        raise RuntimeError("flush blew up")
-    writer.flush = boom
+        raise RuntimeError("write blew up")
+    writer._write_row_group = boom
 
     with pytest.raises(RuntimeError):
         writer.close()
@@ -171,32 +176,104 @@ def test_output_path_layout(tmp_path):
 
 
 def test_flush_raises_if_target_file_already_exists(tmp_path):
-    """A 的最後一道防線：run id 正常不會碰撞，但萬一撞了，flush() 首次建檔前
-    必須拒絕覆寫既有檔案，而不是靜默截斷（實測 5 列變 2 列）。"""
+    """A 的最後一道防線：run id 正常不會碰撞，但萬一撞了，第一次真正落地
+    （row_group_size=1 讓每筆都立即觸發）前必須拒絕覆寫既有檔案，而不是
+    靜默截斷（實測 5 列變 2 列）。"""
     path = tmp_path / "trades.parquet"
     path.write_bytes(b"pretend this is yesterday's finished parquet file")
-    writer = ParquetTradeWriter(path, batch_size=1)
+    writer = ParquetTradeWriter(path, batch_size=1, row_group_size=1)
     with pytest.raises(FileExistsError):
         writer.append(RECORD)
 
 
 def test_flush_interval_seconds_zero_flushes_on_first_append(tmp_path):
-    """D：即使關閉流程正確，batch_size=500 仍可能損失最多 500 筆。
-    flush_interval_seconds=0 時，逾時判斷必須立即成立，第一筆 append 就寫出，
-    不必等到湊滿批次。"""
+    """即使關閉流程正確，緩衝區仍可能損失資料，上限由 flush_interval_seconds
+    把關（不再是 batch_size，B 把兩者解耦了）。flush_interval_seconds=0 時，
+    逾時判斷必須立即成立，第一筆 append 就寫出一個 row group，不必等到湊滿
+    row_group_size。A：寫出的當下只有 .partial，改名成正式檔要等 close()。"""
     path = tmp_path / "trades.parquet"
     writer = ParquetTradeWriter(path, batch_size=100, flush_interval_seconds=0)
     writer.append(RECORD)
-    assert path.exists(), "flush_interval_seconds=0 應在第一筆 append 就觸發寫出"
-    assert writer._buffer == [], "第一筆就該被 flush 出去，緩衝區應已清空"
+    assert writer.partial_path.exists(), \
+        "flush_interval_seconds=0 應在第一筆 append 就觸發寫出"
+    assert not path.exists(), "改名要等 close() 成功寫完 footer"
+    assert writer._buffer == [], "第一筆就該被寫出，緩衝區應已清空"
     writer.close()
+    assert not writer.partial_path.exists()
     assert pq.read_table(path).num_rows == 1
 
 
 def test_flush_interval_does_not_trigger_early_with_default(tmp_path):
-    """既有的批次量測試不可被逾時判斷破壞：預設 30 秒的視窗內不該提早寫出。"""
+    """既有的批次量測試不可被逾時判斷破壞：預設 300 秒的視窗內不該提早寫出。"""
     path = tmp_path / "trades.parquet"
     writer = ParquetTradeWriter(path, batch_size=100)
     writer.append(RECORD)
-    assert not path.exists(), "未逾時、未達批次量不應寫檔"
+    assert not path.exists() and not writer.partial_path.exists(), \
+        "未逾時、未達 row_group_size 不應寫檔"
     writer.close()
+
+
+# -- Task 18：關檔殘檔（A）與 row group 碎片化（B）-------------------------
+
+def test_interrupted_footer_leaves_only_partial_and_no_target_file(tmp_path, capsys):
+    """A：實測證據 —— 122908.parquet 檔頭是 PAR1 但檔尾不是，成因是 close()
+    裡 writer.close() 寫 footer 途中被中斷，留下一個有資料、沒索引、讀不出來
+    的殘檔。修正後應該先寫 <path>.partial，footer 完全寫完才 os.replace 成
+    正式檔；footer 沒寫完就保留 .partial、不改名，目標路徑必須不存在，且要
+    在 stderr 留下痕跡。"""
+    path = tmp_path / "2301" / "122908.parquet"
+    writer = ParquetTradeWriter(path, batch_size=1, row_group_size=1)
+    writer.append(RECORD)                  # batch_size=row_group_size=1 -> 立即寫入，_writer 已開啟
+
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("interrupted while writing the footer")
+        # pyarrow 的 ParquetWriter.__del__ 在物件被 GC 時也會呼叫 close()；
+        # 那不是我們要模擬的那次中斷，讓它安靜成功，避免變成 unraisable
+        # exception 弄髒測試輸出。
+    writer._writer.close = boom
+
+    with pytest.raises(RuntimeError):
+        writer.close()
+
+    assert not path.exists(), "footer 沒寫完，目標檔不該出現"
+    assert writer.partial_path.exists(), "殘檔應留在 .partial，不是直接消失"
+    err = capsys.readouterr().err
+    assert str(writer.partial_path) in err and "footer" in err
+
+    # 同一輪的其他檔案完好如初，不受這個中斷影響。
+    other_path = tmp_path / "2330" / "093000.parquet"
+    with ParquetTradeWriter(other_path) as other_writer:
+        other_writer.append(RECORD)
+    assert pq.read_table(other_path).num_rows == 1
+
+
+def test_normal_close_leaves_no_partial_file_behind(tmp_path):
+    """A：正常關閉（footer 順利寫完）之後，.partial 不該留下，正式檔必須可讀。"""
+    path = tmp_path / "trades.parquet"
+    writer = ParquetTradeWriter(path)
+    writer.append(RECORD)
+    writer.close()
+
+    assert not writer.partial_path.exists()
+    assert path.exists()
+    assert pq.read_table(path).num_rows == 1
+
+
+def test_row_groups_stay_coarse_after_five_thousand_appends(tmp_path):
+    """B：實測證據 —— 190KB 的檔案有 102 個 row group，每組只有 5～11 列
+    （成因是 30 秒逾時 flush 每次都落一個 row group）。修正後持久化頻率
+    與 row group 大小解耦：寫入 5000 列（batch_size=500 => 10 次 flush()
+    呼叫）之後，row group 數要遠小於 flush 次數，例如 <=5 而非 >=50。"""
+    path = tmp_path / "trades.parquet"
+    with ParquetTradeWriter(path, batch_size=500) as writer:
+        for serial in range(5000):
+            writer.append({**RECORD, "serial": serial})
+
+    table_file = pq.ParquetFile(path)
+    assert table_file.num_row_groups <= 5, \
+        f"row group 數過多（{table_file.num_row_groups}），未達解耦效果"
+    assert pq.read_table(path).num_rows == 5000
