@@ -5,6 +5,9 @@
   "Maximum number of connections reached" 斷線。
 - SDK 在 connect 事件內送出 auth frame 但不等回覆，因此必須等
   authenticated 事件才能訂閱，否則被拒為 "Forbidden resource"。
+- 退訂必須帶伺服器在 subscribed 事件裡給的 id：unsubscribe 帶
+  {"channel": ..., "symbol": ...} 會被拒為 "id should not be empty"，
+  且訂閱槽永遠不會釋放，之後任何新訂閱都會撞上 Subscription limit exceeded。
 """
 
 import json
@@ -23,6 +26,9 @@ class FakeStock:
         self.timeline = timeline
         self.handlers = {}
         self.subscriptions = []
+        # 退訂實測必須帶伺服器給的 id（{"id": ...}），不是 channel+symbol；
+        # 這裡原樣記錄送出的參數，讓測試能斷言送的是哪一種形狀。
+        self.unsubscribe_calls: list[dict] = []
         # 讓測試能精準等到「fake 已經跑完 connect+subscribe」，不必用 sleep 賭時序。
         self.connected = threading.Event()
 
@@ -34,11 +40,8 @@ class FakeStock:
         self.timeline.append(("subscribe", params["channel"], params["symbol"]))
 
     def unsubscribe(self, params):
-        self.subscriptions = [
-            s for s in self.subscriptions
-            if not (s["channel"] == params["channel"] and s["symbol"] == params["symbol"])
-        ]
-        self.timeline.append(("unsubscribe", params["channel"], params["symbol"]))
+        self.unsubscribe_calls.append(dict(params))
+        self.timeline.append(("unsubscribe", dict(params)))
 
     def connect(self):
         self.timeline.append(("auth_frame_sent",))
@@ -86,33 +89,24 @@ def run_briefly(feed: FugleFeed, stock: FakeStock) -> None:
 
 
 def test_uses_exactly_one_connection_for_all_symbols(fake_sdk):
-    feed = FugleFeed("k", ["2330", "2317", "2454"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330", "2317", "2454"], lambda t: None)
     run_briefly(feed, fake_sdk.stock)
     assert len(fake_sdk.created) == 1, "API key 只允許一條連線"
 
 
-def test_subscribes_trades_only_by_default(fake_sdk):
+def test_subscribes_trades_only(fake_sdk):
     """一條連線最多 5 個訂閱（實測第 6 個回 Subscription limit exceeded）。
-    預設只訂 trades，讓 5 檔股票剛好用滿預算。"""
-    feed = FugleFeed("k", ["2330", "2317"], lambda t: None, lambda b: None)
+    Task 16 起五檔報價功能已移除，訂閱數就等於追蹤的代碼數。"""
+    feed = FugleFeed("k", ["2330", "2317"], lambda t: None)
     run_briefly(feed, fake_sdk.stock)
     subscribed = {(s["channel"], s["symbol"]) for s in fake_sdk.stock.subscriptions}
     assert subscribed == {("trades", "2330"), ("trades", "2317")}
 
 
-def test_books_are_subscribed_only_for_requested_symbols(fake_sdk):
-    feed = FugleFeed("k", ["2330", "2317"], lambda t: None, lambda b: None,
-                     book_symbols=["2330"])
-    run_briefly(feed, fake_sdk.stock)
-    subscribed = {(s["channel"], s["symbol"]) for s in fake_sdk.stock.subscriptions}
-    assert subscribed == {("trades", "2330"), ("trades", "2317"), ("books", "2330")}
-    assert len(fake_sdk.created) == 1, "五檔仍走同一條連線"
-
-
 def test_subscription_limit_error_is_recorded_not_just_printed(fake_sdk, capsys):
     """超額訂閱目前只印一行 stderr 就繼續跑，那些股票整天沒有資料，
     使用者無從察覺 —— 必須留下可供上層顯示的紀錄。"""
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330"], lambda t: None)
     feed.handle_message(json.dumps({
         "event": "error", "data": {"message": "Subscription limit exceeded"}}))
     assert feed.subscription_errors == ["Subscription limit exceeded"]
@@ -120,7 +114,7 @@ def test_subscription_limit_error_is_recorded_not_just_printed(fake_sdk, capsys)
 
 
 def test_other_api_errors_are_not_counted_as_subscription_errors(fake_sdk, capsys):
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330"], lambda t: None)
     feed.handle_message(json.dumps({
         "event": "error", "data": {"message": "Forbidden resource"}}))
     assert feed.subscription_errors == []
@@ -128,7 +122,7 @@ def test_other_api_errors_are_not_counted_as_subscription_errors(fake_sdk, capsy
 
 
 def test_all_subscriptions_happen_after_authentication(fake_sdk):
-    feed = FugleFeed("k", ["2330", "2317"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330", "2317"], lambda t: None)
     run_briefly(feed, fake_sdk.stock)
     auth_at = fake_sdk.timeline.index(("server_authenticated",))
     first_sub = min(i for i, e in enumerate(fake_sdk.timeline) if e[0] == "subscribe")
@@ -137,7 +131,7 @@ def test_all_subscriptions_happen_after_authentication(fake_sdk):
 
 def test_trade_events_reach_the_trade_callback(fake_sdk):
     trades = []
-    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
+    feed = FugleFeed("k", ["2330"], trades.append)
     feed.handle_message(json.dumps({
         "event": "data", "channel": "trades",
         "data": {"symbol": "2330", "price": 2405, "size": 1, "bid": 2400,
@@ -146,20 +140,9 @@ def test_trade_events_reach_the_trade_callback(fake_sdk):
     assert [t["serial"] for t in trades] == [7]
 
 
-def test_book_events_reach_the_book_callback(fake_sdk):
-    books = []
-    feed = FugleFeed("k", ["2330"], lambda t: None, books.append)
-    feed.handle_message(json.dumps({
-        "event": "data", "channel": "books",
-        "data": {"symbol": "2330", "bids": [{"price": 2390, "size": 226}],
-                 "asks": [{"price": 2395, "size": 343}], "time": 2},
-    }))
-    assert books[0]["bids"][0]["price"] == 2390
-
-
 def test_trial_matches_are_skipped_by_default(fake_sdk):
     trades = []
-    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
+    feed = FugleFeed("k", ["2330"], trades.append)
     feed.handle_message(json.dumps({
         "event": "data", "channel": "trades",
         "data": {"symbol": "2330", "price": 2385, "size": 2113, "isTrial": True,
@@ -170,7 +153,7 @@ def test_trial_matches_are_skipped_by_default(fake_sdk):
 
 def test_trial_matches_kept_when_requested(fake_sdk):
     trades = []
-    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None, include_trials=True)
+    feed = FugleFeed("k", ["2330"], trades.append, include_trials=True)
     feed.handle_message(json.dumps({
         "event": "data", "channel": "trades",
         "data": {"symbol": "2330", "price": 2385, "size": 2113, "isTrial": True,
@@ -181,7 +164,7 @@ def test_trial_matches_kept_when_requested(fake_sdk):
 
 def test_untracked_symbol_is_ignored(fake_sdk):
     trades = []
-    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
+    feed = FugleFeed("k", ["2330"], trades.append)
     feed.handle_message(json.dumps({
         "event": "data", "channel": "trades",
         "data": {"symbol": "2454", "price": 1000, "size": 1, "bid": 999,
@@ -206,7 +189,7 @@ def test_downstream_failure_is_not_reported_as_a_bad_message(fake_sdk, capsys):
     def explode(_trade):
         raise pa.lib.ArrowInvalid("Parquet magic bytes not found in footer")
 
-    feed = FugleFeed("k", ["2330"], explode, lambda b: None)
+    feed = FugleFeed("k", ["2330"], explode)
     feed.handle_message(TRADE_EVENT)
 
     err = capsys.readouterr().err
@@ -225,31 +208,20 @@ def test_callback_failure_does_not_stop_the_feed(fake_sdk, capsys):
             raise RuntimeError("first one blows up")
         seen.append(trade)
 
-    books = []
-
-    def bad_book(_book):
-        raise RuntimeError("book callback blows up")
-
-    feed = FugleFeed("k", ["2330"], flaky, bad_book)
+    feed = FugleFeed("k", ["2330"], flaky)
     feed.handle_message(TRADE_EVENT)                       # 第一筆炸掉
-    feed.handle_message(json.dumps({
-        "event": "data", "channel": "books",
-        "data": {"symbol": "2330", "bids": [], "asks": [], "time": 6},
-    }))                                                    # 五檔回呼也炸掉
     feed.handle_message(json.dumps({**json.loads(TRADE_EVENT)}))
 
     assert [t["serial"] for t in seen] == [10], "回呼失敗不得中斷行情迴圈"
     err = capsys.readouterr().err
     assert "Trade callback failed" in err
-    assert "Book callback failed" in err
-    assert books == []
 
 
 def test_trade_event_without_symbol_is_counted_as_dropped(fake_sdk, capsys):
     """沒有 symbol 的事件（最可能是開盤集合競價）若被靜默丟棄，
     auction_lots 全日為 0 卻沒有任何錯誤。"""
     trades = []
-    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
+    feed = FugleFeed("k", ["2330"], trades.append)
     payload = {"price": 2385, "size": 2024, "volume": 2024,
                "time": 1785891605048734, "serial": 131115}
     feed.handle_message(json.dumps(
@@ -264,7 +236,7 @@ def test_trade_event_without_symbol_is_counted_as_dropped(fake_sdk, capsys):
 
 
 def test_repeated_drops_are_counted_but_printed_once(fake_sdk, capsys):
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330"], lambda t: None)
     event = json.dumps({"event": "data", "channel": "trades",
                         "data": {"price": 2385, "size": 1, "time": 1}})
     for _ in range(3):
@@ -273,37 +245,23 @@ def test_repeated_drops_are_counted_but_printed_once(fake_sdk, capsys):
     assert capsys.readouterr().err.count("Dropping") == 1
 
 
-def test_book_event_for_untracked_symbol_is_dropped_and_counted(fake_sdk):
-    books = []
-    feed = FugleFeed("k", ["2330"], lambda t: None, books.append)
-    feed.handle_message(json.dumps({
-        "event": "data", "channel": "books",
-        "data": {"symbol": "2454", "bids": [], "asks": [], "time": 7},
-    }))
-    assert books == []
-    assert feed.dropped_events["books"] == 1
-    assert feed.dropped_events["trades"] == 0
-
-
 def test_unrecognised_channel_for_tracked_symbol_is_dropped_and_counted(fake_sdk):
-    """symbol 過濾之後才判斷 channel。trades/books 以外的 channel（例如
+    """symbol 過濾之後才判斷 channel。trades 以外的 channel（例如
     candles）目前直接 `return None`，跳過 `_note_dropped`，屬於計數器
     要消滅的那種看不見的丟棄——與沒有 symbol 的事件同一類問題。"""
     trades = []
-    books = []
-    feed = FugleFeed("k", ["2330"], trades.append, books.append)
+    feed = FugleFeed("k", ["2330"], trades.append)
     feed.handle_message(json.dumps({
         "event": "data", "channel": "candles",
         "data": {"symbol": "2330", "open": 2400, "close": 2405, "time": 8},
     }))
     assert trades == []
-    assert books == []
     assert feed.dropped_events["candles"] == 1
 
 
 def test_malformed_message_does_not_kill_the_feed(fake_sdk):
     trades = []
-    feed = FugleFeed("k", ["2330"], trades.append, lambda b: None)
+    feed = FugleFeed("k", ["2330"], trades.append)
     feed.handle_message("not json")                       # JSONDecodeError
     feed.handle_message(json.dumps([1, 2, 3]))             # top level not an object
     feed.handle_message(json.dumps({
@@ -363,7 +321,7 @@ def test_a_reconnects_with_a_new_client_and_backoff_after_repeated_failures(monk
     certifi.where = lambda: "/dev/null"
     monkeypatch.setitem(sys.modules, "certifi", certifi)
 
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330"], lambda t: None)
 
     waits = []
 
@@ -388,8 +346,7 @@ def test_b_watchdog_disconnects_when_the_feed_goes_stale():
     超過 stale_after_seconds 沒收到任何訊息（含 ping/pong 的 pong）就要
     主動呼叫 disconnect() 觸發 A 的重連；還新鮮時不該誤觸發。"""
     calls = []
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None,
-                     stale_after_seconds=90)
+    feed = FugleFeed("k", ["2330"], lambda t: None, stale_after_seconds=90)
     feed._stock = types.SimpleNamespace(disconnect=lambda: calls.append("disconnect"))
 
     feed.last_message_at = time.monotonic()           # 剛收到訊息
@@ -403,7 +360,7 @@ def test_b_watchdog_disconnects_when_the_feed_goes_stale():
 
 def test_c_status_reports_state_freshness_and_reconnect_count():
     """C：status() 要能分辨連線中／重連中，並帶上距離上一則訊息多久。"""
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330"], lambda t: None)
     assert feed.status()["state"] == "reconnecting"   # 還沒連上也算「還在嘗試連線」
     assert feed.status()["last_message_ago"] is None
 
@@ -425,7 +382,7 @@ def test_d_backfill_replays_missed_rest_trades_into_on_trade(monkeypatch):
     """D：重連後（reconnects > 0）要用 REST 補回缺漏的成交，逐筆送進
     on_trade；REST 逐筆資料沒有 symbol 欄位，補資料時要自己補上。"""
     seen = []
-    feed = FugleFeed("k", ["2330"], seen.append, lambda b: None)
+    feed = FugleFeed("k", ["2330"], seen.append)
     feed.reconnects = 1                                # 模擬已經重連過一次
 
     calls = []
@@ -463,7 +420,7 @@ def test_reconnect_resubscribes_the_current_symbol_list_not_the_startup_one(fake
     """add_symbol/remove_symbol 之後若斷線重連，_subscribe_all 必須用當下的
     self.symbols，不是啟動時那份——動態加過的代碼要被訂回來，動態移除的
     代碼不該再被訂閱回去。"""
-    feed = FugleFeed("k", ["2330"], lambda t: None, lambda b: None)
+    feed = FugleFeed("k", ["2330"], lambda t: None)
     thread = threading.Thread(target=feed.run, daemon=True)
     thread.start()
     assert fake_sdk.stock.connected.wait(timeout=2), "初次連線沒有在時限內完成"
@@ -484,3 +441,53 @@ def test_reconnect_resubscribes_the_current_symbol_list_not_the_startup_one(fake
     subscribed = {(s["channel"], s["symbol"]) for s in fake_sdk.stock.subscriptions}
     assert subscribed == {("trades", "2454")}, \
         f"重連應以當下清單訂閱，不是啟動時那份：{subscribed}"
+
+
+# -- Task 16 A：退訂必須帶訂閱 id --------------------------------------------
+#
+# 實測對 Fugle 伺服器直接測得：unsubscribe 帶 {"channel": ..., "symbol": ...}
+# 會被拒為 "id should not be empty"，且訂閱槽永遠不會釋放；必須帶 subscribed
+# 事件回傳的 id 才會被接受。
+
+def test_remove_symbol_unsubscribes_by_id_and_reconnect_clears_the_id_table(fake_sdk):
+    feed = FugleFeed("k", ["2330"], lambda t: None)
+    thread = threading.Thread(target=feed.run, daemon=True)
+    thread.start()
+    assert fake_sdk.stock.connected.wait(timeout=2), "初次連線沒有在時限內完成"
+
+    # 模擬伺服器確認訂閱，回傳這筆訂閱的 id。
+    feed.handle_message(json.dumps({
+        "event": "subscribed",
+        "data": {"channel": "trades", "symbol": "2330", "id": "abc123"},
+    }))
+    assert feed.subscribed_symbols == {"2330"}
+
+    feed.remove_symbol("2330")
+    assert fake_sdk.stock.unsubscribe_calls == [{"id": "abc123"}], \
+        "退訂必須帶伺服器給的 id，不是 channel+symbol"
+
+    # 重連：新連線的訂閱 id 對舊表已經無效，必須清空重建。
+    feed._wait_before_reconnect = lambda seconds: feed._stop_event.wait(timeout=0)
+    fake_sdk.stock.connected.clear()
+    fake_sdk.stock.disconnect()
+    assert fake_sdk.stock.connected.wait(timeout=2), "應該要重新連線"
+
+    assert feed._subscription_ids == {}, "重連後舊的訂閱 id 表必須清空"
+    feed.stop()
+    thread.join(timeout=2)
+
+
+def test_remove_symbol_without_a_confirmed_id_skips_the_doomed_request(fake_sdk, capsys):
+    """還沒收到 subscribed 確認（例如剛重連）就退訂，不該送出必然被拒的
+    請求——那正是實測踩過的坑：channel+symbol 被拒，訂閱槽永遠不會釋放。"""
+    feed = FugleFeed("k", ["2330"], lambda t: None)
+    thread = threading.Thread(target=feed.run, daemon=True)
+    thread.start()
+    assert fake_sdk.stock.connected.wait(timeout=2)
+
+    feed.remove_symbol("2330")             # 從未收到 subscribed 事件
+
+    assert fake_sdk.stock.unsubscribe_calls == [], "沒有 id 就不該送退訂請求"
+    assert "無法退訂" in capsys.readouterr().err
+    feed.stop()
+    thread.join(timeout=2)

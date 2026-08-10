@@ -38,12 +38,9 @@ def bucket_start(time_us: int) -> int:
 
 class SymbolAggregator:
     def __init__(self, symbol: str, large_order_lots: int,
-                 recent_limit: int = 200, name: str = "",
-                 has_book: bool = False) -> None:
+                 recent_limit: int = 200, name: str = "") -> None:
         self.symbol = symbol
         self.name = name
-        # 訂閱預算有限，五檔是選配。畫面要能分辨「沒有買賣盤」與「根本沒訂」。
-        self.has_book = has_book
         self.large_order_lots = large_order_lots
         self.recent_limit = recent_limit
         self.trades: list[dict] = []
@@ -51,11 +48,8 @@ class SymbolAggregator:
         self._levels: dict[float, dict] = {}
         self._large_levels: dict[float, dict] = {}
         self._buckets: dict[int, dict] = {}
-        self.bids: list[dict] = []
-        self.asks: list[dict] = []
         self.last_price: float | None = None
         self.last_trade_time: int | None = None
-        self.book_time: int | None = None
 
     # -- ingest ---------------------------------------------------------
     def add_trade(self, trade: dict) -> dict | None:
@@ -109,11 +103,6 @@ class SymbolAggregator:
             if field is not None:
                 bucket[field] += record["lots"]
 
-    def update_book(self, book: dict) -> None:
-        self.bids = list(book.get("bids") or [])
-        self.asks = list(book.get("asks") or [])
-        self.book_time = book.get("time")
-
     # -- threshold ------------------------------------------------------
     def set_threshold(self, threshold_lots: int) -> None:
         """就地改門檻並重算大單階梯與時間桶；逐筆明細已在記憶體，不需重連。
@@ -141,12 +130,8 @@ class SymbolAggregator:
         return {
             "symbol": self.symbol,
             "name": self.name,
-            "has_book": self.has_book,
             "last_price": self.last_price,
             "last_trade_time": self.last_trade_time,
-            "book_time": self.book_time,
-            "bids": self.bids,
-            "asks": self.asks,
             "ladder": ladder,
             "large_ladder": _ladder_rows(self._large_levels),
             "large_order_lots": self.large_order_lots,

@@ -12,8 +12,6 @@ from app.web import Broadcaster, MarketState
 
 AT_ASK = {"symbol": "2330", "price": 2405, "size": 2, "bid": 2400, "ask": 2405,
           "time": 1785902209312276, "serial": 1}
-BOOK = {"symbol": "2330", "bids": [{"price": 2390, "size": 226}],
-        "asks": [{"price": 2395, "size": 343}], "time": 2}
 
 
 def test_parse_args_accepts_comma_separated_symbols():
@@ -97,39 +95,28 @@ def test_default_threshold_applies_to_every_symbol():
 
 # -- 訂閱預算 -------------------------------------------------------------
 
-def test_five_symbols_without_books_exactly_fills_the_budget():
+def test_five_symbols_exactly_fills_the_budget():
     args = parse_args(["--symbols", "2330,2317,2301,4967,2451"])
     assert len(args.symbols) == MAX_SUBSCRIPTIONS
-    assert args.with_book == []          # 預設不訂五檔
 
 
-def test_with_book_symbols_are_parsed():
-    args = parse_args(["--symbols", "2330,2317,2301", "--with-book", "2330,2317"])
-    assert args.with_book == ["2330", "2317"]
-
-
-def test_subscription_budget_overrun_is_refused_before_starting(capsys):
+def test_six_symbols_overrun_the_budget(capsys):
     """實測：一把 key 的單一連線最多 5 個訂閱，第 6 個起回
     Subscription limit exceeded，程式卻照樣開分頁 —— 那些股票整天沒有資料。"""
     with pytest.raises(SystemExit):
-        parse_args(["--symbols", "2330,2317,2301,4967,2451",
-                    "--with-book", "2330,2317"])
-    err = capsys.readouterr().err
-    assert "7" in err, "訊息要說明目前用量"
-    assert "5" in err, "訊息要說明上限"
-    assert "--with-book" in err, "訊息要說明怎麼調整"
-
-
-def test_six_symbols_alone_already_overrun_the_budget(capsys):
-    with pytest.raises(SystemExit):
         parse_args(["--symbols", "2330,2317,2301,4967,2451,2454"])
-    assert "6" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "6" in err, "訊息要說明目前用量"
+    assert "5" in err, "訊息要說明上限"
 
 
-def test_with_book_for_untracked_symbol_is_refused(capsys):
+# -- Task 16 C：五檔報價功能已移除 --------------------------------------------
+
+def test_with_book_flag_no_longer_exists():
+    """使用者決定：訂閱上限只有 5，不該讓五檔報價跟股票搶配額——整個
+    --with-book 參數已移除，傳入就是 argparse 錯誤。"""
     with pytest.raises(SystemExit):
-        parse_args(["--symbols", "2330", "--with-book", "2454"])
-    assert "2454" in capsys.readouterr().err
+        parse_args(["--symbols", "2330", "--with-book", "2330"])
 
 
 # -- 股票名稱 -------------------------------------------------------------
@@ -199,12 +186,6 @@ def test_pipeline_aggregates_and_persists_trade(tmp_path):
     # 記憶體紀錄仍帶 is_large，但落檔的是可重算的欄位而非當下門檻的旗標
     assert "is_large" not in table.column_names
     assert state.aggregator("2330").trades[0]["is_large"] is True
-
-
-def test_pipeline_updates_book(tmp_path):
-    state, pipeline = build_pipeline(tmp_path)
-    pipeline.handle_book(BOOK)
-    assert state.snapshot("2330")["asks"][0]["price"] == 2395
 
 
 def test_pipeline_does_not_persist_duplicate_serial(tmp_path):

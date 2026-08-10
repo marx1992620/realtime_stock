@@ -9,13 +9,6 @@ AT_BID_AGAIN = {"symbol": "2330", "price": 2400, "size": 1, "bid": 2400, "ask": 
                 "time": 1785902198947291, "serial": 3}
 AUCTION = {"price": 2385, "size": 2024, "time": 1785891605048734, "serial": 4}
 
-BOOK = {
-    "symbol": "2330",
-    "bids": [{"price": 2390, "size": 226}, {"price": 2385, "size": 284}],
-    "asks": [{"price": 2395, "size": 343}, {"price": 2400, "size": 481}],
-    "time": 1785907321886311,
-}
-
 # 09:00:00 整，正好是一個五分鐘桶的起點（1785891600 / 300 整除）
 BUCKET_A = 1785891600_000000
 FIVE_MIN = 300_000_000
@@ -103,29 +96,25 @@ def test_set_threshold_recomputes_large_ladder_without_replaying_feed():
     assert agg.snapshot()["large_ladder"] == []
 
 
-def test_snapshot_carries_book_and_last_price():
+def test_snapshot_carries_last_price_and_no_book_fields():
+    """Task 16 C：五檔報價功能已移除，快照不再帶 bids/asks/book_time/has_book
+    ——訂閱預算只有 5 個，不該讓五檔掛單跟股票搶配額。"""
     agg = SymbolAggregator("2330", large_order_lots=5)
     agg.add_trade(AT_ASK)
-    agg.update_book(BOOK)
     snap = agg.snapshot()
     assert snap["symbol"] == "2330"
     assert snap["last_price"] == 2405
-    assert snap["bids"][0] == {"price": 2390, "size": 226}
-    assert snap["asks"][0] == {"price": 2395, "size": 343}
     assert snap["large_order_lots"] == 5
+    for field in ("bids", "asks", "book_time", "has_book"):
+        assert field not in snap
 
 
-def test_snapshot_carries_name_and_book_subscription_flag():
-    """名稱與「有沒有訂五檔」都要進快照：畫面用前者標題、用後者決定
-    顯示五檔表格還是一行說明。"""
+def test_snapshot_carries_name():
     plain = SymbolAggregator("2330", large_order_lots=5)
     assert plain.snapshot()["name"] == ""
-    assert plain.snapshot()["has_book"] is False
 
-    named = SymbolAggregator("2330", large_order_lots=5,
-                             name="台積電", has_book=True)
+    named = SymbolAggregator("2330", large_order_lots=5, name="台積電")
     assert named.snapshot()["name"] == "台積電"
-    assert named.snapshot()["has_book"] is True
 
 
 def test_snapshot_totals_reconcile_with_ladder():

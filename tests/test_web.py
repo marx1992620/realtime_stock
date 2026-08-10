@@ -12,9 +12,6 @@ INDEX_HTML = (Path(__file__).resolve().parents[1]
 
 AT_ASK = {"symbol": "2330", "price": 2405, "size": 2, "bid": 2400, "ask": 2405,
           "time": 1785902209312276, "serial": 1}
-BOOK = {"symbol": "2330",
-        "bids": [{"price": 2390, "size": 226}],
-        "asks": [{"price": 2395, "size": 343}], "time": 2}
 
 
 def build(symbols=("2330", "2317"), threshold=5):
@@ -29,14 +26,12 @@ def test_symbols_endpoint_lists_tracked_symbols():
     assert body["thresholds"] == {"2330": 5, "2317": 5}
 
 
-def test_snapshot_endpoint_returns_ladder_and_book():
+def test_snapshot_endpoint_returns_ladder():
     state, client = build()
     state.aggregator("2330").add_trade(AT_ASK)
-    state.aggregator("2330").update_book(BOOK)
 
     body = client.get("/api/snapshot/2330").json()
     assert body["last_price"] == 2405
-    assert body["bids"][0]["price"] == 2390
     assert body["ladder"][0]["buy_lots"] == 2
     assert body["totals"]["buy_lots"] == 2
 
@@ -150,7 +145,7 @@ class RecordingBroadcaster(Broadcaster):
 
 class FakeFeed:
     def __init__(self, state="connected", reconnects=0, last_message_ago=1.5,
-                 subscription_count=1):
+                 subscription_count=1, reject_symbols=()):
         self._payload = {"state": state, "last_message_ago": last_message_ago,
                          "reconnects": reconnects, "subscription_errors": []}
         # Task 14：新增／移除標的的假物件，讓 test_web.py 能驗證端點呼叫到
@@ -158,17 +153,28 @@ class FakeFeed:
         self.subscription_count = subscription_count
         self.added: list[str] = []
         self.removed: list[str] = []
+        # Task 16 B：模擬伺服器拒絕訂閱——add_symbol 同步標記結果，讓
+        # web.py 的等待迴圈不必真的等（第一次檢查就拿到答案）。
+        self._reject = set(reject_symbols)
+        self.subscribed_symbols: set[str] = set()
+        self.failed_subscriptions: set[str] = set()
 
     def status(self) -> dict:
         return dict(self._payload)
 
-    def add_symbol(self, symbol: str, with_book: bool = False) -> None:
+    def add_symbol(self, symbol: str) -> None:
         self.added.append(symbol)
         self.subscription_count += 1
+        if symbol in self._reject:
+            self.failed_subscriptions.add(symbol)
+        else:
+            self.subscribed_symbols.add(symbol)
 
     def remove_symbol(self, symbol: str) -> None:
         self.removed.append(symbol)
         self.subscription_count -= 1
+        self.subscribed_symbols.discard(symbol)
+        self.failed_subscriptions.discard(symbol)
 
 
 def test_feed_status_is_exposed_via_rest_and_ws_messages():
@@ -248,26 +254,13 @@ def test_index_page_is_served():
     assert "text/html" in response.headers["content-type"]
 
 
-# -- 名稱與五檔訂閱旗標 ---------------------------------------------------
+# -- 名稱 ------------------------------------------------------------------
 
 def test_snapshot_carries_the_stock_name():
     state = MarketState(["2330", "2317"], large_order_lots=5,
                         names={"2330": "台積電"})
     assert state.snapshot("2330")["name"] == "台積電"
     assert state.snapshot("2317")["name"] == ""      # 取不到名稱不得炸掉
-
-
-def test_snapshot_reports_whether_the_book_is_subscribed():
-    """訂閱預算有限，五檔是選配 —— 畫面要能分辨「沒有買賣盤」與「沒訂」。"""
-    state = MarketState(["2330", "2317"], large_order_lots=5,
-                        book_symbols=["2330"])
-    assert state.snapshot("2330")["has_book"] is True
-    assert state.snapshot("2317")["has_book"] is False
-
-
-def test_book_subscription_defaults_to_none():
-    state = MarketState(["2330"], large_order_lots=5)
-    assert state.snapshot("2330")["has_book"] is False
 
 
 # -- 靜態頁面 -------------------------------------------------------------
@@ -357,13 +350,6 @@ def test_record_trade_ignores_duplicate_serial():
     state, _ = build()
     assert state.record_trade(AT_ASK) is not None
     assert state.record_trade(AT_ASK) is None
-
-
-def test_record_book_reports_whether_symbol_is_tracked():
-    state, _ = build()
-    assert state.record_book(BOOK) is True
-    assert state.record_book({**BOOK, "symbol": "9999"}) is False
-    assert state.snapshot("2330")["bids"][0]["price"] == 2390
 
 
 def test_threshold_change_is_correct_under_concurrent_ingest():
@@ -597,6 +583,30 @@ def test_post_symbols_unknown_symbol_from_rest_is_404():
     assert response.status_code == 404
     assert "9999" not in state.symbols
     assert feed.added == []
+
+
+# -- Task 16 B：訂閱被拒不可靜默留在清單 --------------------------------------
+
+def test_post_symbols_rolls_back_when_subscription_is_rejected():
+    """實測缺陷：訂閱被伺服器拒絕（Subscription limit exceeded）過去會
+    靜默留在追蹤清單裡，畫面看起來正常但永遠不會有資料。POST /api/symbols
+    必須等到 feed 確認訂閱，被標記失敗（或逾時）就整段回滾：聚合器、
+    writer、feed 內部的訂閱嘗試都要清乾淨，不留下任何痕跡。"""
+    state = MarketState(["2330"], large_order_lots=5)
+    feed = FakeFeed(subscription_count=1, reject_symbols={"2454"})
+    pipeline = RecordingPipeline()
+    client = TestClient(create_app(state, Broadcaster(), feed, pipeline=pipeline,
+                                   lookup_name=lambda symbol: "聯發科",
+                                   default_large_order_lots=10))
+
+    response = client.post("/api/symbols", json={"symbol": "2454"})
+
+    assert response.status_code == 409
+    assert "2454" not in state.symbols
+    assert pipeline.removed == ["2454"], "writer 必須被關閉，不然緩衝資料遺失"
+    assert feed.removed == ["2454"], "feed 內部的訂閱嘗試也要回滾，不然佔用訂閱數"
+    with pytest.raises(KeyError):
+        state.aggregator("2454")
 
 
 def test_delete_symbols_removes_symbol_closes_writer_and_unsubscribes():

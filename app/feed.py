@@ -1,12 +1,13 @@
 """Fugle 行情接線。
 
 單一連線約束：一把 API key 只能開一條 WebSocket 連線（實測超過會收到
-close frame "Maximum number of connections reached"），所有股票與頻道都
-必須擠在這一條上。
+close frame "Maximum number of connections reached"），所有股票都必須擠在
+這一條上。
 
 訂閱預算：那條連線最多接受 5 個訂閱，第 6 個起回
-{'message': 'Subscription limit exceeded'}。每檔股票的每個頻道各算一個，
-所以預設只訂 trades，五檔（books）由呼叫端以 book_symbols 明確指定。
+{'message': 'Subscription limit exceeded'}。每檔股票訂 trades 各算一個
+（Task 16 起五檔報價功能已移除，不再跟股票搶配額），所以訂閱數就等於追蹤
+的代碼數。
 
 連線韌性（Task 13）：實地發生過 Mac 睡眠、TCP 半開死亡卻沒有任何症狀——
 沒有錯誤、沒有重連、時間戳就這樣凍住，95 分鐘資料悄悄消失。因此：
@@ -15,6 +16,21 @@ close frame "Maximum number of connections reached"），所有股票與頻道�
 - SDK 內建的 ping/pong（health_check）加上自己的閒置看門狗兩層防護半開連線。
 - status() 把健康狀態暴露出來，讓上層（web、UI）不必再靠「有沒有印錯誤」
   這種脆弱的訊號去猜資料還新不新鮮。
+
+訂閱確認與退訂（Task 16 A/B）：實測對 Fugle 伺服器直接測得——
+unsubscribe 帶 {"channel": ..., "symbol": ...} 會被拒為
+{'message': 'id should not be empty'}，且訂閱槽**永遠不會釋放**；必須帶
+subscribed 事件回傳的 id（{"id": ...}）才會被接受。因此：
+- 收到 subscribed 事件要記下 data["id"]，以 symbol 為鍵存進
+  self._subscription_ids；remove_symbol 一律用這個 id 退訂，找不到 id 就
+  不送必然被拒的請求，只印一行 stderr。
+- 收到 unsubscribed 事件、或我們自己送出退訂時，把該筆 id 從表中移除。
+- 重連會拿到全新的 id，舊表對新連線已經無效，_subscribe_all 每次都清空
+  重建（同一份邏輯也覆蓋第一次連線）。
+- 訂閱被拒（Subscription limit exceeded）不可静默留在追蹤清單裡看起來
+  正常：self._pending_subscribe 記下最近一次送出訂閱的代碼，被拒時標記進
+  self._subscribe_failed；subscribed_symbols / failed_subscriptions 讓上層
+  （web.py 的 POST /api/symbols）能等待確認、逾時或失敗就回滾。
 """
 
 from __future__ import annotations
@@ -40,16 +56,11 @@ _PARSE_ERRORS = (json.JSONDecodeError, AttributeError, KeyError, TypeError, Valu
 class FugleFeed:
     def __init__(self, api_key: str, symbols: list[str],
                  on_trade: Callable[[dict], None],
-                 on_book: Callable[[dict], None],
                  include_trials: bool = False,
-                 book_symbols: list[str] | None = None,
                  stale_after_seconds: float = 90.0) -> None:
         self.api_key = api_key
         self.symbols = list(symbols)
-        # 只有這些代碼會另外訂 books；未指定即全部不訂，把預算留給 trades。
-        self.book_symbols = list(book_symbols or [])
         self.on_trade = on_trade
-        self.on_book = on_book
         self.include_trials = include_trials
         # 超額訂閱只印一行 stderr 就繼續跑，那些股票整天不會有任何資料，
         # 使用者無從察覺。留下紀錄讓上層能把它顯示出來。
@@ -59,6 +70,14 @@ class FugleFeed:
         # 就像「今天沒有集合競價」。
         self.dropped_events: collections.Counter = collections.Counter()
         self._stock = None
+
+        # -- 訂閱確認狀態（Task 16 A/B）------------------------------------
+        # symbol -> 伺服器在 subscribed 事件裡給的 id；退訂必須用這個。
+        self._subscription_ids: dict[str, str] = {}
+        # 最近一次送出 subscribe 請求的代碼；不需要完美對應，Subscription
+        # limit exceeded 一來就把它標記失敗。
+        self._pending_subscribe: str | None = None
+        self._subscribe_failed: set[str] = set()
 
         # -- 連線韌性狀態（Task 13）------------------------------------
         self.stale_after_seconds = stale_after_seconds
@@ -104,8 +123,8 @@ class FugleFeed:
     def _on_message(self, raw: str) -> None:
         """SDK 的 "message" 事件掛這個，而不是直接掛 handle_message。
 
-        任何訊息都算「活著」的證據，包含 ping/pong 的 pong —— 盤中若完全沒
-        訂閱 books、又剛好沒有成交，pong 仍會定期進來，看門狗才不會誤判。
+        任何訊息都算「活著」的證據，包含 ping/pong 的 pong —— 盤中若剛好沒有
+        成交，pong 仍會定期進來，看門狗才不會誤判。
         """
         self.last_message_at = time.monotonic()
         self.handle_message(raw)
@@ -119,7 +138,29 @@ class FugleFeed:
             return None
         if name == "subscribed":
             data = event.get("data") or {}
-            print(f"Subscribed: {data.get('channel')} {data.get('symbol')}", flush=True)
+            symbol = data.get("symbol")
+            sub_id = data.get("id")
+            # 記下這筆訂閱的 id：退訂必須帶它，帶 channel+symbol 會被伺服器
+            # 拒為 "id should not be empty" 且訂閱槽永遠不會釋放（實測）。
+            if symbol is not None and sub_id:
+                self._subscription_ids[symbol] = sub_id
+            if symbol is not None:
+                self._subscribe_failed.discard(symbol)
+            print(f"Subscribed: {data.get('channel')} {symbol}", flush=True)
+            return None
+        if name == "unsubscribed":
+            data = event.get("data") or {}
+            symbol = data.get("symbol")
+            sub_id = data.get("id")
+            if symbol is not None:
+                current = self._subscription_ids.get(symbol)
+                # 只在這則確認對應「目前記錄的那一筆」才清掉：remove_symbol 已
+                # 經在送出退訂當下就同步清過一次，這裡多半是 no-op；但若這期間
+                # 使用者又很快把同一檔加回來、拿到全新的 id，這則遲到的
+                # unsubscribed 確認絕不能誤刪剛建立好的新訂閱。
+                if current is None or sub_id is None or current == sub_id:
+                    self._subscription_ids.pop(symbol, None)
+            print(f"Unsubscribed: {data.get('channel')} {symbol}", flush=True)
             return None
         if name == "error":
             data = event.get("data")
@@ -128,6 +169,9 @@ class FugleFeed:
             text = message if isinstance(message, str) else str(data)
             if "Subscription limit" in text:
                 self.subscription_errors.append(text)
+                # 不需要完美對應：最近一次送出的那個代碼最可能是被拒的那個。
+                if self._pending_subscribe is not None:
+                    self._subscribe_failed.add(self._pending_subscribe)
             return None
         if name != "data":
             return None
@@ -141,8 +185,6 @@ class FugleFeed:
             if data.get("isTrial", False) and not self.include_trials:
                 return None
             return "Trade", self.on_trade, data
-        if channel == "books":
-            return "Book", self.on_book, data
         self._note_dropped(channel, data)
         return None
 
@@ -161,12 +203,16 @@ class FugleFeed:
     def _subscribe_all(self, _message=None) -> None:
         # 只在伺服器確認認證後才送訂閱：SDK 在 connect 事件內送出 auth frame
         # 卻不等回覆，此時訂閱會被拒為 "Forbidden resource"。
-        # 先訂 trades（那是主要目的），books 只給指定的代碼。訂閱預算不足時
-        # 被拒的會是排在後面的五檔，而不是隨機某檔股票的逐筆。
+        #
+        # 重連會拿到全新的訂閱 id，舊表對這條新連線已經無效；同一份邏輯也
+        # 覆蓋第一次連線，此時只是在空字典上操作、no-op。同理清空
+        # _subscribe_failed：新連線值得重新嘗試，不該延續上一條連線的失敗
+        # 標記。
+        self._subscription_ids.clear()
+        self._subscribe_failed.clear()
         for symbol in self.symbols:
+            self._pending_subscribe = symbol
             self._stock.subscribe({"channel": "trades", "symbol": symbol})
-        for symbol in self.book_symbols:
-            self._stock.subscribe({"channel": "books", "symbol": symbol})
 
     def _make_disconnect_handler(self, stock) -> Callable[..., None]:
         """回傳一個只認「目前這條連線」的斷線 handler。
@@ -287,45 +333,68 @@ class FugleFeed:
                 stock.disconnect()
 
     # -- 盤中動態增刪（Task 14 C）--------------------------------------------
-    def add_symbol(self, symbol: str, with_book: bool = False) -> None:
+    def add_symbol(self, symbol: str) -> None:
         """在既有連線上訂閱一檔新代碼；不開第二條連線（一把 key 只能一條）。
 
-        先更新 self.symbols/self.book_symbols 再送訂閱：更新清單本身不需要
-        連線存在，即使目前正在重連中途（self._stock 是 None）也不會遺失
-        這個新代碼——下一次連線的 _subscribe_all 會用當下這份清單重新訂閱。
+        先更新 self.symbols 再送訂閱：更新清單本身不需要連線存在，即使目前
+        正在重連中途（self._stock 是 None）也不會遺失這個新代碼——下一次
+        連線的 _subscribe_all 會用當下這份清單重新訂閱。
         """
         if symbol not in self.symbols:
             self.symbols.append(symbol)
-        if with_book and symbol not in self.book_symbols:
-            self.book_symbols.append(symbol)
+        # 重新嘗試訂閱同一檔，之前的失敗標記就不該再擋著它。
+        self._subscribe_failed.discard(symbol)
         if self._stock is None:
             return
+        self._pending_subscribe = symbol
         self._stock.subscribe({"channel": "trades", "symbol": symbol})
-        if with_book:
-            self._stock.subscribe({"channel": "books", "symbol": symbol})
 
     def remove_symbol(self, symbol: str) -> None:
-        """退訂一檔代碼（trades，若原本也訂了 books 則一併退），並從清單移除。
+        """退訂一檔代碼（trades）並從清單移除。
 
         清單一移除，handle_message 的代碼過濾立刻生效（就算退訂的 REST/WS
         呼叫本身失敗，之後進來的該代碼事件也不會再被送進聚合器），未來的
         重連也不會再把它訂回來。
+
+        退訂必須帶伺服器在 subscribed 事件裡給的 id——實測 unsubscribe 帶
+        {"channel": ..., "symbol": ...} 會被拒為 "id should not be empty"，
+        且訂閱槽永遠不會釋放，之後任何新訂閱都會撞上
+        "Subscription limit exceeded"。找不到 id 時（例如訂閱還沒被確認、
+        剛重連、或訂閱本身早就被伺服器拒絕）就不送這個必然被拒的請求，只留
+        一行 stderr 說明。
         """
-        had_book = symbol in self.book_symbols
         if symbol in self.symbols:
             self.symbols.remove(symbol)
-        if had_book:
-            self.book_symbols.remove(symbol)
+        self._subscribe_failed.discard(symbol)
+        if self._pending_subscribe == symbol:
+            self._pending_subscribe = None
         if self._stock is None:
             return
-        self._stock.unsubscribe({"channel": "trades", "symbol": symbol})
-        if had_book:
-            self._stock.unsubscribe({"channel": "books", "symbol": symbol})
+        sub_id = self._subscription_ids.pop(symbol, None)
+        if sub_id is None:
+            print(f"無法退訂 {symbol}：沒有對應的訂閱 id（可能還沒收到 subscribed "
+                  "確認，或訂閱已被伺服器拒絕），略過退訂請求", file=sys.stderr, flush=True)
+            return
+        self._stock.unsubscribe({"id": sub_id})
 
     @property
     def subscription_count(self) -> int:
-        """目前訂閱數（trades + books），供上層在新增前做預算檢查。"""
-        return len(self.symbols) + len(self.book_symbols)
+        """目前訂閱數，供上層在新增前做預算檢查。"""
+        return len(self.symbols)
+
+    @property
+    def subscribed_symbols(self) -> set[str]:
+        """目前確實收到 subscribed 確認的代碼集合（Task 16 B）。
+
+        訂閱被伺服器拒絕時該代碼不會出現在這裡；上層（POST /api/symbols）
+        靠這個分辨「訂閱真的成功了」而不是靜默留在清單裡看起來正常。
+        """
+        return set(self._subscription_ids)
+
+    @property
+    def failed_subscriptions(self) -> set[str]:
+        """最近一次訂閱被伺服器拒絕（Subscription limit exceeded）的代碼。"""
+        return set(self._subscribe_failed)
 
     # -- 狀態可見（C）------------------------------------------------------
     def status(self) -> dict:

@@ -181,25 +181,6 @@ function tradeTable(rows, title) {
     ${body}</table></div>`;
 }
 
-function bookTable(snap) {
-  // 訂閱預算有限，五檔是選配 —— 要能分辨「沒有買賣盤」與「根本沒訂」。
-  if (!snap.has_book) {
-    return `<h2>五檔</h2><p class="muted">未訂閱五檔報價。
-      一條連線最多 5 個訂閱，每檔股票已佔 1 個；
-      需要時請以 <code>--with-book ${esc(snap.symbol)}</code> 啟動。</p>`;
-  }
-  const rows = [];
-  for (let i = snap.asks.length - 1; i >= 0; i--) {
-    rows.push(`<tr><td class="sell">賣${i + 1}</td><td>${snap.asks[i].price}</td><td>${fmt(snap.asks[i].size)}</td></tr>`);
-  }
-  snap.bids.forEach((b, i) => {
-    rows.push(`<tr><td class="buy">買${i + 1}</td><td>${b.price}</td><td>${fmt(b.size)}</td></tr>`);
-  });
-  if (!rows.length) return `<h2>五檔</h2><p class="muted">尚無資料</p>`;
-  return `<h2>五檔 <span class="muted">${clock(snap.book_time)}</span></h2>
-    <table><tr><th>檔位</th><th>價格</th><th>張數</th></tr>${rows.join("")}</table>`;
-}
-
 // -- 大單流向圖 -----------------------------------------------------------
 // 原生 SVG，無任何外部套件。柱＝大單張數（買向上、賣向下，零線在中間），
 // 折線＝股價（右軸）。雙軸是使用者指定的；因此兩軸都標單位，格線只屬於
@@ -335,7 +316,7 @@ function flowChart(snap) {
 }
 
 // 重繪前後保留使用者的位置與輸入。整塊替換 innerHTML 每秒最多發生 5 次
-// （五檔更新頻繁，0.2 秒合併一次），不保留的話全日價位階梯與 200 列明細
+// （更新合併間隔 0.2 秒），不保留的話全日價位階梯與 200 列明細
 // 在盤中根本捲不動，門檻也打不完一個數字。
 function scrollOffsets(panels) {
   return [...panels.querySelectorAll("section")].map(section => {
@@ -362,6 +343,8 @@ function render() {
   panels.innerHTML = `
     <section>
       <h2>${label(snap)}</h2>
+      ${snap.subscribed === false ? `<p class="muted" style="color: var(--warn)">
+        ⚠ 訂閱尚未獲得伺服器確認，這個分頁暫時不會有任何資料。</p>` : ""}
       <div class="price">${snap.last_price ?? "—"}</div>
       <div class="muted">最新成交 ${clock(snap.last_trade_time)}｜共 ${fmt(snap.trade_count)} 筆</div>
       <table style="margin-top:.5rem">
@@ -381,7 +364,6 @@ function render() {
       </div>
     </section>
     <section class="wide">${flowChart(snap)}</section>
-    <section>${bookTable(snap)}</section>
     <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
     <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${fmt(snap.large_order_lots)} 張）`)}</section>
     <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>`;
@@ -427,11 +409,17 @@ document.addEventListener("mousemove", event => {
 });
 
 function renderTabs() {
-  document.getElementById("tabs").innerHTML = state.symbols.map(s =>
-    `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
-      label(state.snapshots[s])
-    }<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button></span>`
-  ).join("");
+  document.getElementById("tabs").innerHTML = state.symbols.map(s => {
+    const snap = state.snapshots[s];
+    // 訂閱未獲確認的代碼不能看起來跟正常追蹤中的代碼一樣——那正是實測踩過
+    // 的坑：新增的股票靜靜留在分頁上，永遠不會有任何資料。
+    const warn = snap && snap.subscribed === false
+      ? `<span class="muted" style="color: var(--warn)" title="訂閱尚未獲得伺服器確認，暫時不會有資料">⚠</span>`
+      : "";
+    return `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
+      warn}${label(snap)
+    }<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button></span>`;
+  }).join("");
   document.querySelectorAll(".tab").forEach(el =>
     el.addEventListener("click", event => {
       if (event.target.closest(".tab-remove")) return;   // 交給移除鈕自己的 handler
@@ -518,7 +506,7 @@ document.getElementById("newSymbol").onkeydown = event => {
 // -- 行情健康度 ------------------------------------------------------------
 // 這是使用者判斷資料可不可信的唯一依據：實地發生過 Mac 睡眠、TCP 半開死亡，
 // 畫面卻照樣顯示「已連線」，唯一症狀是時間戳凍住。這裡刻意不只靠 ws 推播
-// 更新這個狀態——行情真的斷線時，恰好就是不會再有 trade/book 觸發推播的
+// 更新這個狀態——行情真的斷線時，恰好就是不會再有 trade 觸發推播的
 // 時候，只依賴 ws 訊息會讓這個指標在最需要的時候跟著一起凍住。所以另外
 // 用一個獨立的輪詢，直接問伺服器 GET /api/feed。
 function renderFeedStatus(feed) {

@@ -62,10 +62,6 @@ class Pipeline:
             writer.append(record)
         self.broadcaster.publish(record["symbol"])
 
-    def handle_book(self, book: dict) -> None:
-        if self.state.record_book(book):
-            self.broadcaster.publish(book["symbol"])
-
     def add_writer(self, symbol: str) -> None:
         """新增一檔的 writer。檔名沿用 Task 12 的 output_path 規則，run id
         用啟動時那個——移除後再新增同一代碼會撞到同一個檔名，此時沿用
@@ -107,11 +103,6 @@ def _symbol_list(raw: str) -> list[str]:
     if not symbols:
         raise argparse.ArgumentTypeError("至少要指定一個股票代碼")
     return symbols
-
-
-def _optional_symbol_list(raw: str) -> list[str]:
-    """--with-book 允許留空（等於全部不訂五檔）。"""
-    return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def _lots(raw: str, what: str) -> int:
@@ -217,10 +208,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="大單門檻（張數）。可寫單一數字（全部套用）、"
                              "逐檔 2330=20,2317=5，或兩者混用 10,2330=20"
                              f"（預設 {DEFAULT_LARGE_ORDER_LOTS} 張）")
-    parser.add_argument("--with-book", type=_optional_symbol_list, default=[],
-                        help="要另外訂閱五檔報價的代碼，逗號分隔，例如 2330,2317。"
-                             f"每個都會多佔 1 個訂閱（一條連線上限 {MAX_SUBSCRIPTIONS} 個），"
-                             "未指定即全部不訂")
     parser.add_argument("--output-dir", type=Path, default=Path("data"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -239,21 +226,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      f"{', '.join(missing)}")
     args.large_order = {s: overrides.get(s, default) for s in args.symbols}
 
-    stray = [s for s in args.with_book if s not in args.symbols]
-    if stray:
-        parser.error(f"--with-book 指定了不在 --symbols 內的代碼：{', '.join(stray)}")
-    args.with_book = list(dict.fromkeys(args.with_book))   # 去重，重複不該多算預算
-
-    # 訂閱預算必須在啟動「之前」擋下來：一條連線只接受 5 個訂閱，超過的會被
-    # 回 Subscription limit exceeded 而靜默失效 —— 分頁照開，那些股票整天
-    # 沒有資料，使用者無從察覺。
-    used = len(args.symbols) + len(args.with_book)
+    # 訂閱預算必須在啟動「之前」擋下來：一條連線只接受 5 個訂閱（每檔股票的
+    # 成交資料佔 1 個，Task 16 起五檔報價功能已移除，不再跟股票搶配額），
+    # 超過的會被伺服器回 Subscription limit exceeded 而靜默失效 —— 分頁照
+    # 開，那些股票整天沒有資料，使用者無從察覺。
+    used = len(args.symbols)
     if used > MAX_SUBSCRIPTIONS:
         parser.error(
-            f"訂閱數 {used} 超過上限 {MAX_SUBSCRIPTIONS}"
-            f"（{len(args.symbols)} 檔股票 + {len(args.with_book)} 檔五檔報價）。\n"
-            "每檔股票佔 1 個訂閱，每個 --with-book 再佔 1 個。\n"
-            "請減少 --symbols 或 --with-book。")
+            f"股票代碼數 {used} 超過訂閱上限 {MAX_SUBSCRIPTIONS}"
+            "（每檔股票佔 1 個訂閱）。請減少 --symbols。")
     return args
 
 
@@ -270,15 +251,13 @@ def main(argv: list[str] | None = None) -> None:
     run_id = datetime.datetime.now().strftime("%H%M%S")
     # REST 取名不佔 WebSocket 的訂閱預算，開連線前先問完。
     names = fetch_names(api_key, args.symbols)
-    state = MarketState(args.symbols, large_order_lots=args.large_order,
-                        names=names, book_symbols=args.with_book)
+    state = MarketState(args.symbols, large_order_lots=args.large_order, names=names)
     broadcaster = Broadcaster()
     writers = build_writers(args.output_dir, today, args.symbols, run_id)
     pipeline = Pipeline(state, broadcaster, writers,
                         output_dir=args.output_dir, date_str=today, run_id=run_id)
     feed = FugleFeed(api_key, args.symbols, pipeline.handle_trade,
-                     pipeline.handle_book, include_trials=args.include_trials,
-                     book_symbols=args.with_book)
+                     include_trials=args.include_trials)
 
     # 一把 API key 只能開一條連線：確認沒有其他收集器在跑，否則會被伺服器
     # 以 "Maximum number of connections reached" 斷線。feed.run() 自己會在
@@ -288,10 +267,8 @@ def main(argv: list[str] | None = None) -> None:
     labels = {s: f"{s} {names[s]}".strip() for s in args.symbols}
     thresholds = "、".join(f"{labels[s]} {args.large_order[s]}" for s in args.symbols)
     print(f"追蹤 {', '.join(labels[s] for s in args.symbols)}"
-          f"｜大單門檻（張）{thresholds}", flush=True)
-    print(f"五檔報價 {', '.join(labels[s] for s in args.with_book) or '未訂閱'}"
-          f"｜訂閱數 {len(args.symbols) + len(args.with_book)}/{MAX_SUBSCRIPTIONS}",
-          flush=True)
+          f"｜大單門檻（張）{thresholds}"
+          f"｜訂閱數 {len(args.symbols)}/{MAX_SUBSCRIPTIONS}", flush=True)
     print(f"看盤畫面 http://{args.host}:{args.port}", flush=True)
     app = create_app(state, broadcaster, feed, pipeline=pipeline,
                      lookup_name=functools.partial(lookup_symbol_name, api_key),

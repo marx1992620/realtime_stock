@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
@@ -28,8 +29,13 @@ _STATIC = Path(__file__).resolve().parent / "static"
 # 輸入；REST 查名稱那一步才是真正判斷「這檔股票是否存在」。
 _SYMBOL_RE = re.compile(r"^\d{4,6}$")
 
-# 五檔每秒可有數次更新，逐一推送對瀏覽器沒有意義；同一檔在此間隔內合併。
+# 同一檔在此間隔內合併多次更新，逐一推送對瀏覽器沒有意義。
 PUSH_INTERVAL_SECONDS = 0.2
+
+# 新增代碼後等待伺服器確認訂閱的上限秒數（Task 16 B）：訂閱被拒
+# （Subscription limit exceeded）不可靜默留在追蹤清單裡看起來正常。
+SUBSCRIBE_CONFIRM_TIMEOUT_SECONDS = 3.0
+SUBSCRIBE_CONFIRM_POLL_SECONDS = 0.05
 
 
 class ThresholdIn(BaseModel):
@@ -88,15 +94,14 @@ class Broadcaster:
 class MarketState:
     """所有聚合器狀態的持有者，並負責跨執行緒互斥。
 
-    兩個執行緒會寫入：Fugle SDK 的行情執行緒（record_trade / record_book），
+    兩個執行緒會寫入：Fugle SDK 的行情執行緒（record_trade），
     以及 FastAPI 跑同步路由的工作執行緒（set_threshold）。所有寫入與讀取都
     走同一把鎖，否則重算大單階梯時被切斷會造成永久性的重複計數。
     """
 
     def __init__(self, symbols: list[str],
                  large_order_lots: int | dict[str, int],
-                 names: dict[str, str] | None = None,
-                 book_symbols: list[str] | None = None) -> None:
+                 names: dict[str, str] | None = None) -> None:
         self.symbols = list(symbols)
         # 純數字 = 全部同一個門檻；dict 則必須涵蓋每一檔（缺漏就 KeyError，
         # 悄悄套用某個預設值只會讓錯誤的門檻在盤中無聲生效）。
@@ -106,8 +111,6 @@ class MarketState:
             for s in self.symbols
         }
         names = names or {}
-        # 五檔是選配（訂閱預算有限），快照要帶著這個事實給畫面。
-        with_book = set(book_symbols or ())
         # RLock 而非 Lock：新增／移除標的（Task 14）是「檢查 → 預算檢查 →
         # REST 取名 → 建立聚合器 → 通知 feed」一整串複合動作，全部要在同一次
         # 鎖持有期間完成才不會被另一個並發請求插隊造成重複建立；route handler
@@ -116,8 +119,7 @@ class MarketState:
         # 重入用一般 Lock 會直接死鎖，必須是 RLock。
         self.lock = threading.RLock()
         self._aggregators = {
-            s: SymbolAggregator(s, self._thresholds[s],
-                                name=names.get(s, ""), has_book=s in with_book)
+            s: SymbolAggregator(s, self._thresholds[s], name=names.get(s, ""))
             for s in self.symbols
         }
 
@@ -129,7 +131,7 @@ class MarketState:
 
     def aggregator(self, symbol: str) -> SymbolAggregator:
         """未加鎖的直接存取，僅供測試與單執行緒檢視。
-        正式的寫入路徑一律用 record_trade / record_book。"""
+        正式的寫入路徑一律用 record_trade。"""
         if symbol not in self._aggregators:
             raise KeyError(symbol)
         return self._aggregators[symbol]
@@ -141,16 +143,6 @@ class MarketState:
         with self.lock:
             aggregator = self._aggregators.get(symbol)
             return aggregator.add_trade(trade) if aggregator is not None else None
-
-    def record_book(self, book: dict) -> bool:
-        """更新五檔快照；未追蹤代碼回傳 False。"""
-        symbol = book.get("symbol")
-        with self.lock:
-            aggregator = self._aggregators.get(symbol)
-            if aggregator is None:
-                return False
-            aggregator.update_book(book)
-            return True
 
     def set_threshold(self, threshold_lots: int, symbol: str | None = None) -> None:
         """symbol 為 None 時套用全部；指定時只重算該檔。未追蹤代碼 raise KeyError。"""
@@ -218,6 +210,41 @@ def _feed_status(feed) -> dict:
     payload["subscription_count"] = feed.subscription_count
     payload["subscription_limit"] = MAX_SUBSCRIPTIONS
     return payload
+
+
+def _annotate_subscribed(snapshot: dict, symbol: str, feed) -> dict:
+    """幫快照加上 subscribed: bool（Task 16 B）。
+
+    沒有 feed 時（測試常用）視為已訂閱，不必為此另外接一個假物件；有 feed
+    時看 feed.subscribed_symbols——訂閱被拒或還沒確認的代碼要能被畫面
+    分辨出來，不能看起來跟正常追蹤中的代碼一樣。
+    """
+    subscribed = True if feed is None else symbol in feed.subscribed_symbols
+    return {**snapshot, "subscribed": subscribed}
+
+
+def _annotate_all_subscribed(snapshots: dict, feed) -> dict:
+    return {symbol: _annotate_subscribed(snap, symbol, feed)
+            for symbol, snap in snapshots.items()}
+
+
+def _wait_for_subscription(feed, symbol: str,
+                           timeout: float = SUBSCRIBE_CONFIRM_TIMEOUT_SECONDS) -> bool:
+    """等到 feed 確認 symbol 的訂閱成功、被標記失敗，或逾時。
+
+    刻意用短輪詢而非跨執行緒的等待物件：確認結果來自 feed 執行緒（SDK 的
+    "subscribed"／"error" 事件），呼叫端在 FastAPI 的工作執行緒，這裡不持有
+    MarketState 的鎖，短暫輪詢不會擋住任何其他請求或 /ws 推播。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if symbol in feed.subscribed_symbols:
+            return True
+        if symbol in feed.failed_subscriptions:
+            return False
+        if time.monotonic() >= deadline:
+            return symbol in feed.subscribed_symbols
+        time.sleep(SUBSCRIBE_CONFIRM_POLL_SECONDS)
 
 
 def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
@@ -298,6 +325,22 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
             if feed is not None:
                 feed.add_symbol(symbol)
 
+        # 訂閱的確認來自 feed 執行緒的非同步事件，鎖必須先釋放才等——不然
+        # 等待期間會擋住所有其他 HTTP 請求與 /ws 推播（實測缺陷：退訂被
+        # 伺服器拒絕會靜默燒掉一個訂閱槽，這裡的確認同樣不可以是靜默的）。
+        if feed is not None and not _wait_for_subscription(feed, symbol):
+            with state.lock:
+                if pipeline is not None:
+                    pipeline.remove_writer(symbol)
+                if state.has_symbol(symbol):
+                    state.remove_symbol(symbol)
+                feed.remove_symbol(symbol)
+                used = feed.subscription_count
+            raise HTTPException(
+                status_code=409,
+                detail=f"訂閱被伺服器拒絕（目前用量 {used}/{MAX_SUBSCRIPTIONS}），"
+                       "請稍後重試或先移除一檔")
+
         broadcaster.publish(symbol)
         return {"symbols": state.symbols, "thresholds": state.thresholds}
 
@@ -323,11 +366,12 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
     @app.get("/api/snapshot/{symbol}")
     def snapshot(symbol: str) -> dict:
         try:
-            return state.snapshot(symbol)
+            snap = state.snapshot(symbol)
         except KeyError:
             raise HTTPException(
                 status_code=404, detail=f"symbol not tracked: {symbol}"
             ) from None
+        return _annotate_subscribed(snap, symbol, feed)
 
     @app.post("/api/threshold")
     def set_threshold(body: ThresholdIn) -> dict:
@@ -353,7 +397,8 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
         snapshots, thresholds = await asyncio.to_thread(
             lambda: (state.snapshot_all(), state.thresholds))
         # feed.status() 不碰 MarketState 的鎖，只讀幾個屬性，不必 to_thread。
-        await websocket.send_json({"type": "init", "snapshots": snapshots,
+        await websocket.send_json({"type": "init",
+                                   "snapshots": _annotate_all_subscribed(snapshots, feed),
                                    "thresholds": thresholds,
                                    "feed": _feed_status(feed)})
         queue = broadcaster.subscribe()
@@ -407,7 +452,8 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
                             # 安靜跳過即可，不必讓整條 ws 連線因此掛掉。
                             continue
                         await websocket.send_json({"type": "update",
-                                                   "snapshot": snapshot,
+                                                   "snapshot": _annotate_subscribed(
+                                                       snapshot, name, feed),
                                                    "feed": _feed_status(feed)})
 
                 if disconnected:
