@@ -1,0 +1,42 @@
+# -----------------------------------------------------------------------
+# 重要：一把 Fugle API key 只允許同時開「一條」WebSocket 連線。
+#
+# 這是 Fugle 伺服器端的硬限制，不是這支程式的設計選擇：
+#   - 絕對不要對這個 service 下 `docker compose up --scale tracker=2`
+#     （或任何形式的多副本）。
+#   - 絕對不要在一台以上的機器同時用同一把 key 跑這個 service。
+# 兩個以上的連線用同一把 key 連上去，會被伺服器互踢
+# （`Maximum number of connections reached`），造成兩邊都不穩定地斷線重連。
+# 如果需要多份行情，去 Fugle 申請多把 key，一把 key 對一個長駐執行個體。
+# -----------------------------------------------------------------------
+services:
+  tracker:
+    build: .
+    image: tw-stock-tracker
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 資料留在主機：容器刪掉、重建，data/ 底下的 Parquet 都還在。程式本身
+      # 每次執行用新的 run id 建新檔（見 Task 12／app/storage.py），所以
+      # restart: unless-stopped 造成的重啟只會累加新檔案，不會覆寫舊資料。
+      #
+      # 首次啟動前請先 `mkdir -p data && chmod 777 data`（或視部署主機情況
+      # `chown -R 1000:1000 data`），讓容器內的非 root 使用者（uid 1000）能
+      # 寫入——bind mount 掛進去的目錄一律沿用主機端的擁有者/權限，Dockerfile
+      # 裡對 /app、/data 做的 chown 只在「掛載之前」有效，詳見 README。
+      - ./data:/data
+    env_file:
+      # FUGLE_API_KEY 留在主機的 .env，不進映像檔（見 .dockerignore）。
+      # 也可以改用 environment: FUGLE_API_KEY: ${FUGLE_API_KEY} 從主機環境
+      # 帶入，效果相同，兩者擇一即可。
+      - .env
+    command:
+      - --symbols
+      - "2330,2317,2301,4967,2451"
+      - --large-order
+      - "5,2330=3"
+      - --host
+      - "0.0.0.0"          # 容器內必須綁 0.0.0.0；CLI 預設的 127.0.0.1 只給本機直跑用
+      - --output-dir
+      - /data

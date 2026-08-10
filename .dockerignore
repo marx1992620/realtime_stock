@@ -1,0 +1,33 @@
+# 只把執行需要的東西放進映像檔；其餘一律排除。
+
+# 機密與環境檔——絕不可進映像檔
+.env
+.env.*
+!.env.example
+
+# 資料與執行期產物：資料要留在主機，不進映像
+data/
+
+# 測試、文件、規劃紀錄——不是執行期需要的東西
+tests/
+test_collector.py
+docs/
+.superpowers/
+README.md
+
+# 不屬於這個任務、非我方所有，不應進映像也不應被 commit
+training_set/
+.DS_Store
+
+# VCS 與一般開發雜物
+.git/
+.gitignore
+.dockerignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 編輯器/系統雜物
+.vscode/
+.idea/

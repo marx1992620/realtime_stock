@@ -119,6 +119,87 @@ Fugle 的成交事件沒有買賣旗標，方向由成交價與當下最佳一�
 python3 -m pytest -q
 ```
 
+## Docker 部署
+
+想把 `app` 搬到另一台 server 長駐執行，不想手動裝 Python 環境，可以用容器跑。
+
+### 建置映像檔
+
+```bash
+docker build -t tw-stock-tracker .
+```
+
+`Dockerfile` 只複製 `app/`、`collector.py`（`app/__main__.py` 會 import 它取用
+`load_dotenv`）與 `requirements.txt` 進映像檔；`.env`、`data/`、`tests/` 等一律不進去
+（見 `.dockerignore`）。容器內以非 root 使用者執行，且固定用 `--host 0.0.0.0`
+（CLI 本身 `--host` 預設仍是 `127.0.0.1`，本機直跑沒有改，容器要能對外連才在
+`docker run`／`docker-compose.yml` 的參數上覆寫）。
+
+### 用環境變數帶 API key
+
+映像檔裡不含任何金鑰，`FUGLE_API_KEY` 一律在啟動容器時才注入：
+
+```bash
+docker run --rm -p 8000:8000 -v $(pwd)/data:/data \
+  -e FUGLE_API_KEY=your_real_key \
+  tw-stock-tracker --symbols 2330,2317 --host 0.0.0.0 --output-dir /data
+```
+
+或用 `docker compose`（見下方），從主機的 `.env` 帶入，`.env` 本身留在主機、不進映像。
+
+### 用 docker compose 跑起來
+
+```bash
+cp .env.example .env   # 填入真實的 FUGLE_API_KEY，這個檔案不會進映像檔
+docker compose up -d --build
+docker compose logs -f
+```
+
+`docker-compose.yml` 內已經帶好 `--host 0.0.0.0` 與 `--output-dir /data`，並把
+`./data` 掛進容器的 `/data`。
+
+**首次啟動前**，請確認主機上的 `./data` 目錄容器內的執行使用者（uid 1000）可以
+寫入，例如：
+
+```bash
+mkdir -p data && chmod 777 data
+# 或者，若主機是 Linux 且想收緊權限：sudo chown -R 1000:1000 data
+```
+
+（容器內建置時已經 `chown` 過 `/data`，但 bind mount 掛載當下，掛進去的目錄一律
+沿用**主機端**的擁有者/權限，Dockerfile 裡的 `chown` 對「掛載進來之後」的路徑不
+生效，所以主機端也要有寫入權限。）
+
+### 資料在哪
+
+資料一樣落在 `data/<日期>/<代碼>/<run>.parquet`，只是「容器內看到的路徑」是
+`/data/...`，因為掛了 `./data:/data`——實際檔案還是在主機的 `./data`。容器被砍掉、
+重建都不影響既有檔案；沿用 Task 12 的規則，每次啟動是新的 run id、新的檔案，重啟
+不會覆寫前一次執行留下的資料。
+
+### 怎麼改追蹤清單
+
+兩種方式：
+
+1. **不重啟**：直接在網頁上用「新增／移除股票」的功能即時調整（見上方「畫面看什麼」），
+   不需要改 compose 檔或重啟容器。
+2. **改預設值**：改 `docker-compose.yml` 裡 `command:` 的 `--symbols`／`--large-order`
+   等參數，`docker compose up -d` 重建套用（這樣做會斷線重連一次，當下這幾秒的行情
+   會漏接）。
+
+### ⚠️ 單一實例限制
+
+跟本機直跑一樣，**一把 API key 只能開一條 WebSocket 連線**，這是 Fugle 伺服器端的
+硬限制。因此：
+
+- **不要**對這個 service 用 `docker compose up --scale`（或任何形式的多副本）。
+- **不要**在一台以上的機器同時用同一把 key 跑這個容器（也不可以和本機直跑的
+  `python3 -m app` 或 `collector.py` 同時開）。
+
+兩條以上的連線用同一把 key 連上去，會被伺服器互踢
+（`Maximum number of connections reached`），造成雙方都不穩定地斷線重連。
+`docker-compose.yml` 裡也有同樣的註解提醒。
+
 ---
 
 # collector.py（舊版單檔收集器）
