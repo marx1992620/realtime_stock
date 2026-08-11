@@ -272,7 +272,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"看盤畫面 http://{args.host}:{args.port}", flush=True)
     app = create_app(state, broadcaster, feed, pipeline=pipeline,
                      lookup_name=functools.partial(lookup_symbol_name, api_key),
-                     default_large_order_lots=DEFAULT_LARGE_ORDER_LOTS)
+                     default_large_order_lots=DEFAULT_LARGE_ORDER_LOTS,
+                     history_api_key=api_key)
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     except KeyboardInterrupt:

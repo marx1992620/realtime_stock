@@ -18,6 +18,13 @@
     --ok: #1f8a3d;
     --warn: #b3690a;
     --bad: #c0392b;
+    /* 均線：單一藍色由淺到深（5 日最淺、120 日最深），刻意避開蠟燭的
+       紅綠——顏色本身帶有「快慢」的意義。已通過 dataviz 驗證器，勿自行更換。 */
+    --ma5: #cde2fb;
+    --ma10: #9ec5f4;
+    --ma20: #6da7ec;
+    --ma60: #3987e5;
+    --ma120: #256abf;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -31,6 +38,11 @@
       --ok: #3fbf67;
       --warn: #e0a233;
       --bad: #e0605a;
+      --ma5: #b7d3f6;
+      --ma10: #86b6ef;
+      --ma20: #5598e7;
+      --ma60: #2a78d6;
+      --ma120: #184f95;
     }
   }
   /* 明確指定主題時要蓋過系統偏好，兩個方向都要能蓋。 */
@@ -38,11 +50,13 @@
     --buy: #e66767; --sell: #008300; --ink: #e9e9e9; --muted-ink: #9d9d9d;
     --grid: #3a3a3a; --axis: #565656; --surface: #1b1b1b;
     --ok: #3fbf67; --warn: #e0a233; --bad: #e0605a;
+    --ma5: #b7d3f6; --ma10: #86b6ef; --ma20: #5598e7; --ma60: #2a78d6; --ma120: #184f95;
   }
   :root[data-theme="light"] {
     --buy: #e34948; --sell: #008300; --ink: #1c1c1c; --muted-ink: #6b6b6b;
     --grid: #dcdcdc; --axis: #b4b4b4; --surface: #ffffff;
     --ok: #1f8a3d; --warn: #b3690a; --bad: #c0392b;
+    --ma5: #cde2fb; --ma10: #9ec5f4; --ma20: #6da7ec; --ma60: #3987e5; --ma120: #256abf;
   }
 
   body { font: 14px/1.5 -apple-system, "PingFang TC", sans-serif; margin: 1rem;
@@ -94,6 +108,7 @@
   .key.buy { background: var(--buy); }
   .key.sell { background: var(--sell); }
   .key.close { width: 14px; height: 2px; border-radius: 1px; background: var(--ink); }
+  .key.line { width: 14px; height: 2px; border-radius: 1px; }
   .chart { width: 100%; height: auto; display: block; overflow: visible; }
   .chart .gridline { stroke: var(--grid); stroke-width: 1; }
   .chart .zero { stroke: var(--axis); stroke-width: 1; }
@@ -109,6 +124,13 @@
   .chart .closedot { fill: var(--ink); stroke: var(--surface); stroke-width: 2; }
   .chart .hit { fill: var(--ink); opacity: 0; }
   .chart .hit:hover { opacity: .07; }
+
+  /* -- 歷史K棒 + 均線圖 -- */
+  .chart .candle-wick { stroke-width: 1; }
+  .chart .ma-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .chart .hchit { fill: var(--ink); opacity: 0; cursor: crosshair; }
+  .chart .hchit:hover { opacity: .07; }
+  .hint { color: var(--muted-ink); font-size: .85em; }
 
   #tip { position: fixed; z-index: 10; pointer-events: none;
          background: var(--surface); color: var(--ink);
@@ -134,7 +156,12 @@
 <div id="tip" hidden></div>
 
 <script>
-const state = { snapshots: {}, symbols: [], active: null, feed: null };
+const state = {
+  snapshots: {}, symbols: [], active: null, feed: null,
+  // -- 歷史K棒 + 均線（Task 17）：client 端快取，切分頁不必每次都重打
+  // /api/history（伺服器端也快取，但這裡再省一次 HTTP 往返與重繪）。
+  historyCache: {}, historyView: {}, historyLoading: {}, historyError: {},
+};
 const fmt = n => (n ?? 0).toLocaleString("zh-TW");
 const money = n => (n ?? 0).toLocaleString("zh-TW", { maximumFractionDigits: 0 });
 const clock = us => us ? new Date(us / 1000).toLocaleTimeString("zh-TW", { hour12: false }) : "—";
@@ -315,6 +342,230 @@ function flowChart(snap) {
     </svg>`;
 }
 
+// -- 歷史K棒 + 均線圖（Task 17）-------------------------------------------
+// 通用元件：只依賴 /api/history/{symbol} 回傳的 {symbol,name,candles,ma}，
+// 不知道也不需要知道背後是股票還是（日後的）期貨合約。原生 SVG，無套件。
+const HCH = { w: 880, h: 320, ml: 60, mr: 16, mt: 16, mb: 34 };
+const MA_PERIODS = [5, 10, 20, 60, 120];
+const MIN_VISIBLE_BARS = 20;
+
+// 預設看最近 90 根；資料不足 90 根就整段顯示。
+function defaultHistoryView(total) {
+  const count = Math.min(90, total);
+  return { start: total - count, count };
+}
+
+// 縮放與資料長度變動後夾回合法範圍：count 在 [20, total]，start 在
+// [0, total-count]。資料剛載入、或（理論上）縮放到邊界時都要夾一次。
+function clampHistoryView(view, total) {
+  const minCount = Math.min(MIN_VISIBLE_BARS, total);
+  const count = Math.max(minCount, Math.min(total, Math.round(view.count)));
+  const start = Math.max(0, Math.min(total - count, Math.round(view.start)));
+  return { start, count };
+}
+
+function priceTicks(min, max, count = 5) {
+  if (max - min < 1e-9) { max += 0.5; min -= 0.5; }
+  return Array.from({ length: count }, (_, i) => min + (max - min) * i / (count - 1));
+}
+
+function historyChartHTML(symbol) {
+  const title = `<h2>歷史日K + 均線</h2>`;
+  if (state.historyError[symbol]) {
+    return `${title}<p class="muted" style="color: var(--bad)">${esc(state.historyError[symbol])}</p>`;
+  }
+  const data = state.historyCache[symbol];
+  if (!data) return `${title}<p class="muted">載入中…</p>`;
+  if (!data.candles.length) return `${title}<p class="muted">尚無資料</p>`;
+  return candleChart(data);
+}
+
+function candleChart(data) {
+  const { symbol, candles, ma } = data;
+  const total = candles.length;
+  const view = clampHistoryView(
+    state.historyView[symbol] || defaultHistoryView(total), total);
+  state.historyView[symbol] = view;
+  const { start, count } = view;
+  const visible = candles.slice(start, start + count);
+
+  const plotW = HCH.w - HCH.ml - HCH.mr;
+  const plotH = HCH.h - HCH.mt - HCH.mb;
+  const slot = plotW / count;
+  // 實體寬度隨可見根數自適應；空間不足 1px 時不畫實體，只留影線
+  // （本來就會畫），視覺上自然收斂成一張線圖，不會畫出重疊的方塊。
+  const bodyW = Math.max(0, slot - 2);
+  const drawBody = bodyW >= 1;
+
+  // y 軸範圍依目前可見區間的蠟燭高低點自動調整，不是固定全期。刻意不把
+  // 均線的值也算進來撐開範圍——長週期均線（例如 120 日）縮到很短的窗口
+  // 時常常會偏離當下價格很多，若把它也算進 y 軸，蠟燭會被擠成一小條，
+  // 反而更難看懂。均線超出範圍的部分改用 clipPath 在圖表邊界切齊
+  // （見下方 <clipPath>），效果等同「線跑出圖外」，跟大部分看盤軟體一致。
+  let lo = Math.min(...visible.map(c => c.low));
+  let hi = Math.max(...visible.map(c => c.high));
+  const pad = (hi - lo) * 0.06 || Math.max(1, hi * 0.02);
+  lo -= pad; hi += pad;
+  const priceY = p => HCH.mt + (hi - p) / (hi - lo) * plotH;
+
+  const grid = priceTicks(lo, hi).map(v => {
+    const y = priceY(v);
+    return `<line class="gridline" x1="${HCH.ml}" y1="${y}" x2="${HCH.ml + plotW}" y2="${y}"/>`
+         + `<text class="tick" x="${HCH.ml - 8}" y="${y + 4}" text-anchor="end">${tickText(v)}</text>`;
+  }).join("");
+
+  let wicks = "", bodies = "";
+  visible.forEach((c, i) => {
+    const x = HCH.ml + i * slot + slot / 2;
+    const up = c.close >= c.open;
+    const color = `var(--${up ? "buy" : "sell"})`;
+    const yHigh = priceY(c.high), yLow = priceY(c.low);
+    wicks += `<line class="candle-wick" x1="${x}" y1="${yHigh}" x2="${x}" y2="${yLow}" stroke="${color}"/>`;
+    if (drawBody) {
+      const yOpen = priceY(c.open), yClose = priceY(c.close);
+      const yTop = Math.min(yOpen, yClose);
+      const h = Math.max(1, Math.abs(yClose - yOpen));    // 平盤（開＝收）也要畫得出來
+      bodies += `<rect class="candle-body" x="${x - bodyW / 2}" y="${yTop}" `
+              + `width="${bodyW}" height="${h}" fill="${color}"/>`;
+    }
+  });
+
+  // 均線：null 的區段要斷開，不可跨過空值直連——每遇到 null 就重新
+  // "M" 起筆，而不是接著 "L" 畫過去。
+  let maPaths = "";
+  MA_PERIODS.forEach(period => {
+    const arr = ma[String(period)];
+    let d = "", drawing = false;
+    for (let i = 0; i < count; i++) {
+      const v = arr[start + i];
+      if (v == null) { drawing = false; continue; }
+      const x = HCH.ml + i * slot + slot / 2;
+      const y = priceY(v);
+      d += (drawing ? "L" : "M") + `${x} ${y}`;
+      drawing = true;
+    }
+    if (d) maPaths += `<path class="ma-line" d="${d}" stroke="var(--ma${period})"/>`;
+  });
+
+  // x 軸：依縮放程度疏化，日期像素間距太近就往左捨棄（最新一根一定留著）。
+  const step = Math.max(1, Math.ceil(count / 8));
+  const wanted = [];
+  for (let i = 0; i < count; i += step) wanted.push(i);
+  if (wanted[wanted.length - 1] !== count - 1) wanted.push(count - 1);
+  const kept = [];
+  for (let k = wanted.length - 1; k >= 0; k--) {
+    const x = HCH.ml + wanted[k] * slot + slot / 2;
+    if (!kept.length || kept[kept.length - 1].x - x >= 56) kept.push({ i: wanted[k], x });
+  }
+  const dateLabels = kept.map(({ i, x }) =>
+    `<text class="tick" x="${x}" y="${HCH.mt + plotH + 18}" text-anchor="middle">${
+      visible[i].date.slice(5)}</text>`).join("");
+
+  const hits = visible.map((_, i) =>
+    `<rect class="hchit" data-i="${i}" x="${HCH.ml + i * slot}" y="${HCH.mt}" `
+    + `width="${slot}" height="${plotH}"/>`).join("");
+
+  const legend = `<div class="legend">
+      <span><i class="key buy"></i>漲</span>
+      <span><i class="key sell"></i>跌</span>
+      ${MA_PERIODS.map(p =>
+        `<span><i class="key line" style="background:var(--ma${p})"></i>${p}日均線</span>`
+      ).join("")}
+    </div>`;
+
+  return `<h2>歷史日K + 均線 <span class="hint">${esc(data.name || symbol)}・顯示 ${count} / ${total} 根・滾輪縮放</span></h2>
+    ${legend}
+    <svg class="chart" id="historyChartSvg" viewBox="0 0 ${HCH.w} ${HCH.h}" preserveAspectRatio="xMidYMid meet"
+         role="img" aria-label="歷史日K棒與移動平均線">
+      <defs>
+        <clipPath id="historyClip"><rect x="${HCH.ml}" y="${HCH.mt}" width="${plotW}" height="${plotH}"/></clipPath>
+      </defs>
+      ${grid}
+      <g clip-path="url(#historyClip)">${wicks}${bodies}${maPaths}</g>
+      ${dateLabels}
+      <text class="axis-title" x="14" y="${HCH.mt + plotH / 2}" text-anchor="middle"
+            transform="rotate(-90 14 ${HCH.mt + plotH / 2})">價格（元）</text>
+      ${hits}
+    </svg>`;
+}
+
+// 滾輪縮放：以游標位置為錨點——縮放前後，游標底下那根K棒要留在原地，
+// 不能整張圖只錨在右端（那樣放大時使用者看到的內容會整個跳掉）。
+function onHistoryWheel(event, symbol) {
+  event.preventDefault();                 // 不擋住就會整頁跟著捲動
+  const data = state.historyCache[symbol];
+  if (!data) return;
+  const total = data.candles.length;
+  const view = clampHistoryView(
+    state.historyView[symbol] || defaultHistoryView(total), total);
+
+  const rect = event.currentTarget.getBoundingClientRect();
+  const scaleX = HCH.w / rect.width;                 // viewBox 座標 ≠ CSS 像素
+  const px = (event.clientX - rect.left) * scaleX;
+  const plotW = HCH.w - HCH.ml - HCH.mr;
+  const frac = Math.min(1, Math.max(0, (px - HCH.ml) / plotW));
+  const anchorIdx = view.start + frac * view.count;   // 游標底下那根的資料索引
+
+  const factor = event.deltaY < 0 ? 0.85 : 1 / 0.85;  // 向上（deltaY<0）放大＝根數變少
+  const nextCount = view.count * factor;
+  const nextStart = anchorIdx - frac * nextCount;      // 保持錨點在同一個像素位置
+
+  state.historyView[symbol] = clampHistoryView(
+    { start: nextStart, count: nextCount }, total);
+  refreshHistoryBox(symbol);
+}
+
+function historyTipHTML(symbol, localIndex) {
+  const data = state.historyCache[symbol];
+  const view = state.historyView[symbol];
+  if (!data || !view) return null;
+  const c = data.candles[view.start + localIndex];
+  if (!c) return null;
+  const maLine = MA_PERIODS.map(p => {
+    const v = data.ma[String(p)][view.start + localIndex];
+    return `${p}日 ${v != null ? v.toFixed(2) : "—"}`;
+  }).join("　");
+  return `<b>${c.date}</b><br>開 ${c.open}　高 ${c.high}　低 ${c.low}　收 ${c.close}<br>
+    量 ${fmt(c.volume)}<br><span class="muted">${maLine}</span>`;
+}
+
+// 只重繪歷史圖那個容器，不動整個面板——縮放時不該把價位階梯的捲動位置
+// 或門檻輸入框的游標一起弄丟。
+function refreshHistoryBox(symbol) {
+  if (symbol !== state.active) return;     // 分頁已經切走，這次更新過期了
+  const box = document.getElementById("historyChartBox");
+  if (!box) return;
+  box.innerHTML = historyChartHTML(symbol);
+  bindHistoryChart(symbol);
+}
+
+async function ensureHistory(symbol) {
+  if (state.historyCache[symbol] || state.historyLoading[symbol]) return;
+  state.historyLoading[symbol] = true;
+  state.historyError[symbol] = null;
+  try {
+    const response = await fetch(`/api/history/${encodeURIComponent(symbol)}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      state.historyError[symbol] = body.detail || `載入失敗（HTTP ${response.status}）`;
+      return;
+    }
+    state.historyCache[symbol] = body;
+    state.historyView[symbol] = defaultHistoryView(body.candles.length);
+  } catch {
+    state.historyError[symbol] = "載入失敗：無法連線到伺服器";
+  } finally {
+    state.historyLoading[symbol] = false;
+    refreshHistoryBox(symbol);
+  }
+}
+
+function bindHistoryChart(symbol) {
+  const svg = document.getElementById("historyChartSvg");
+  if (svg) svg.addEventListener("wheel", event => onHistoryWheel(event, symbol), { passive: false });
+  ensureHistory(symbol);                   // 已快取或載入中時是 no-op
+}
+
 // 重繪前後保留使用者的位置與輸入。整塊替換 innerHTML 每秒最多發生 5 次
 // （更新合併間隔 0.2 秒），不保留的話全日價位階梯與 200 列明細
 // 在盤中根本捲不動，門檻也打不完一個數字。
@@ -364,6 +615,7 @@ function render() {
       </div>
     </section>
     <section class="wide">${flowChart(snap)}</section>
+    <section class="wide" id="historyChartBox">${historyChartHTML(state.active)}</section>
     <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
     <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${fmt(snap.large_order_lots)} 張）`)}</section>
     <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>`;
@@ -376,6 +628,7 @@ function render() {
   }
   fresh.onkeydown = event => { if (event.key === "Enter") applyThreshold(); };
   document.getElementById("apply").onclick = applyThreshold;
+  bindHistoryChart(state.active);
 }
 
 async function applyThreshold() {
@@ -390,16 +643,24 @@ async function applyThreshold() {
   });
 }
 
-// 提示框放在 #panels 之外，重繪不會把它連同事件一起換掉。
+// 提示框放在 #panels 之外，重繪不會把它連同事件一起換掉。兩張圖（大單流向、
+// 歷史K棒）共用同一個提示框，用 hit 元素的 class 分辨要顯示哪一種內容。
 const tip = document.getElementById("tip");
 document.addEventListener("mousemove", event => {
-  const hit = event.target.closest ? event.target.closest(".hit") : null;
-  const snap = state.snapshots[state.active];
-  const bucket = hit && snap && (snap.buckets || [])[Number(hit.dataset.i)];
-  if (!bucket) { tip.hidden = true; return; }
-  tip.innerHTML = `<b>${hhmm(bucket.t)}–${hhmm(bucket.t + BUCKET_US)}</b><br>
-    買 ${fmt(bucket.buy_lots)} 張<br>賣 ${fmt(bucket.sell_lots)} 張<br>
-    收盤 ${bucket.close}`;
+  const flowHit = event.target.closest ? event.target.closest(".hit") : null;
+  const histHit = event.target.closest ? event.target.closest(".hchit") : null;
+  let html = null;
+  if (flowHit) {
+    const snap = state.snapshots[state.active];
+    const bucket = snap && (snap.buckets || [])[Number(flowHit.dataset.i)];
+    if (bucket) html = `<b>${hhmm(bucket.t)}–${hhmm(bucket.t + BUCKET_US)}</b><br>
+      買 ${fmt(bucket.buy_lots)} 張<br>賣 ${fmt(bucket.sell_lots)} 張<br>
+      收盤 ${bucket.close}`;
+  } else if (histHit) {
+    html = historyTipHTML(state.active, Number(histHit.dataset.i));
+  }
+  if (!html) { tip.hidden = true; return; }
+  tip.innerHTML = html;
   tip.hidden = false;
   const pad = 14;
   const x = Math.min(event.clientX + pad, window.innerWidth - tip.offsetWidth - 4);

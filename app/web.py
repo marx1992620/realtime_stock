@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from app.aggregator import SymbolAggregator
 from app.feed import MAX_SUBSCRIPTIONS
+from app.history import HistoryCache, HistoryError
 
 _STATIC = Path(__file__).resolve().parent / "static"
 
@@ -250,12 +251,19 @@ def _wait_for_subscription(feed, symbol: str,
 def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
                pipeline=None,
                lookup_name: Callable[[str], str | None] | None = None,
-               default_large_order_lots: int | None = None) -> FastAPI:
+               default_large_order_lots: int | None = None,
+               history_api_key: str | None = None) -> FastAPI:
     """pipeline／lookup_name 都是選配的協作物件，讓新增／移除標的的端點能
     分別建立與關閉該代碼的 writer（pipeline.add_writer/remove_writer）、
     以 REST 查名稱（lookup_name）——兩者都注入而不是寫死 import，這樣
     web.py 本身不必知道 fugle_marketdata SDK 或 Pipeline 的具體實作，測試
-    可以用假物件替換，__main__.py 才是真正接上 SDK 與檔案系統的地方。"""
+    可以用假物件替換，__main__.py 才是真正接上 SDK 與檔案系統的地方。
+
+    history_api_key 同理是選配的：GET /api/history 是純 REST（不佔訂閱
+    配額），沒有 key 就無法查歷史資料，但這不該讓整個 app 建不起來
+    （測試常常不需要這個端點）。HistoryCache 在這裡建立、每個 create_app
+    各一份，測試裡的每個 build() 因此天然互不污染彼此的快取。"""
+    history_cache = HistoryCache()
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 廣播器要在事件迴圈起來後才能綁定。使用 lifespan 而非
@@ -372,6 +380,34 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
                 status_code=404, detail=f"symbol not tracked: {symbol}"
             ) from None
         return _annotate_subscribed(snap, symbol, feed)
+
+    @app.get("/api/history/{symbol}")
+    def history(symbol: str) -> dict:
+        """歷史日 K ＋均線，通用元件（Task 17）：純 REST，不佔 WebSocket
+        訂閱配額，未追蹤的代碼也允許查詢。這是阻塞式 I/O（HTTP 打
+        api.fugle.tw），路由刻意用同步 def——FastAPI 會丟到工作執行緒，
+        絕不能出現在事件迴圈上，否則一次歷史查詢會卡住所有 /ws 推播與
+        其他 HTTP 請求。"""
+        if history_api_key is None:
+            raise HTTPException(
+                status_code=500, detail="history API key not configured")
+
+        name = ""
+        if lookup_name is not None:
+            looked_up = lookup_name(symbol)
+            # 沿用 POST /api/symbols 的判斷方式：查不到名稱＝代碼無效，
+            # 回 404 比讓歷史資料 API 自己出錯好——那個錯誤訊息不是給
+            # 使用者看的。
+            if looked_up is None:
+                raise HTTPException(
+                    status_code=404, detail=f"symbol not found: {symbol}")
+            name = looked_up
+
+        try:
+            return history_cache.get(history_api_key, symbol, name)
+        except HistoryError as error:
+            status = error.status_code if error.status_code == 404 else 502
+            raise HTTPException(status_code=status, detail=str(error)) from error
 
     @app.post("/api/threshold")
     def set_threshold(body: ThresholdIn) -> dict:

@@ -1,4 +1,6 @@
 import asyncio
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -623,3 +625,109 @@ def test_delete_symbols_removes_symbol_closes_writer_and_unsubscribes():
     assert pipeline.removed == ["2317"]                      # writer 被關閉（close 在 Pipeline.remove_writer 內）
     with pytest.raises(KeyError):
         state.aggregator("2317")
+
+
+# -- GET /api/history/{symbol}（Task 17）-----------------------------------
+
+def fake_candles_module(monkeypatch, candles):
+    """比照 test_history.py：換掉整個 fugle_marketdata 模組，
+    GET /api/history 內部經 app.history.fetch_daily_candles 用到它，
+    不必真的打 API。"""
+    sdk = types.ModuleType("fugle_marketdata")
+
+    class RestClient:
+        def __init__(self, **kwargs):
+            self.stock = types.SimpleNamespace(
+                historical=types.SimpleNamespace(candles=candles))
+
+    sdk.RestClient = RestClient
+    monkeypatch.setitem(sys.modules, "fugle_marketdata", sdk)
+
+
+def _raw_candle(date, close):
+    return {"date": date, "open": close, "high": close, "low": close,
+            "close": close, "volume": 1000}
+
+
+def test_get_history_returns_candles_and_moving_averages(monkeypatch):
+    calls = []
+
+    def candles(symbol, **params):
+        calls.append(params)
+        return {"data": [_raw_candle("2026-01-03", 103),
+                         _raw_candle("2026-01-02", 102),
+                         _raw_candle("2026-01-01", 101)]}
+
+    fake_candles_module(monkeypatch, candles)
+    state = MarketState(["2330"], large_order_lots=5)
+    client = TestClient(create_app(state, Broadcaster(),
+                                   lookup_name=lambda symbol: "台積電",
+                                   history_api_key="fake-key"))
+
+    response = client.get("/api/history/2330")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["symbol"] == "2330"
+    assert body["name"] == "台積電"
+    assert [c["date"] for c in body["candles"]] == ["2026-01-01", "2026-01-02", "2026-01-03"]
+    assert set(body["ma"].keys()) == {"5", "10", "20", "60", "120"}
+    assert len(body["ma"]["5"]) == 3
+    # 預設抓的天數（DEFAULT_HISTORY_DAYS）超過單次請求上限，
+    # fetch_daily_candles 內部本來就會分段成多次請求，這裡只確認真的打了 API。
+    assert len(calls) >= 1
+
+
+def test_get_history_of_untracked_symbol_still_works(monkeypatch):
+    """純 REST，不佔訂閱配額——未追蹤的代碼也允許查詢（例如指數 IX0001）。"""
+    fake_candles_module(monkeypatch, lambda symbol, **params:
+                        {"data": [_raw_candle("2026-01-01", 100)]})
+    state = MarketState(["2330"], large_order_lots=5)
+    client = TestClient(create_app(state, Broadcaster(),
+                                   lookup_name=lambda symbol: "發行量加權股價指數",
+                                   history_api_key="fake-key"))
+
+    response = client.get("/api/history/IX0001")
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "IX0001"
+    assert "IX0001" not in state.symbols
+
+
+def test_get_history_of_invalid_symbol_is_404():
+    state = MarketState(["2330"], large_order_lots=5)
+    client = TestClient(create_app(state, Broadcaster(),
+                                   lookup_name=lambda symbol: None,
+                                   history_api_key="fake-key"))
+
+    assert client.get("/api/history/9999").status_code == 404
+
+
+def test_get_history_second_request_uses_cache_not_api(monkeypatch):
+    calls = []
+
+    def candles(symbol, **params):
+        calls.append(params)
+        return {"data": [_raw_candle("2026-01-01", 100)]}
+
+    fake_candles_module(monkeypatch, candles)
+    state = MarketState(["2330"], large_order_lots=5)
+    client = TestClient(create_app(state, Broadcaster(),
+                                   lookup_name=lambda symbol: "台積電",
+                                   history_api_key="fake-key"))
+
+    first = client.get("/api/history/2330")
+    calls_after_first = len(calls)
+    second = client.get("/api/history/2330")
+
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert calls_after_first > 0, "第一次請求要真的打到 API"
+    assert len(calls) == calls_after_first, "第二次請求應該走快取，不重打 API"
+
+
+def test_get_history_without_api_key_configured_is_500():
+    state = MarketState(["2330"], large_order_lots=5)
+    client = TestClient(create_app(state, Broadcaster(),
+                                   lookup_name=lambda symbol: "台積電"))
+    assert client.get("/api/history/2330").status_code == 500
