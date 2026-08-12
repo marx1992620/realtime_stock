@@ -149,6 +149,7 @@
   </div>
   <span id="subUsage"></span>
   <span id="status"><i class="dot"></i>連線中…</span>
+  <span id="futStatus" class="muted"></span>
 </header>
 <div id="symbolError" hidden></div>
 
@@ -194,7 +195,7 @@ function ladderTable(rows, title) {
     ${body}</table></div>`;
 }
 
-function tradeTable(rows, title) {
+function tradeTable(rows, title, unit) {
   if (!rows.length) return `<h2>${title}</h2><p class="muted">尚無資料</p>`;
   const body = rows.map(t => `<tr>
       <td>${clock(t.time)}</td>
@@ -204,7 +205,7 @@ function tradeTable(rows, title) {
       <td>${money(t.value_twd)}</td>
     </tr>`).join("");
   return `<h2>${title}</h2><div class="scroll"><table>
-    <tr><th>時間</th><th>價格</th><th>別</th><th>張數</th><th>金額</th></tr>
+    <tr><th>時間</th><th>價格</th><th>別</th><th>${unit}數</th><th>金額</th></tr>
     ${body}</table></div>`;
 }
 
@@ -237,9 +238,9 @@ function barPath(x, w, zeroY, len, up) {
        + `L${x + w - r} ${y}Q${x + w} ${y} ${x + w} ${y - r}L${x + w} ${zeroY}Z`;
 }
 
-function flowChart(snap) {
+function flowChart(snap, unit) {
   const buckets = snap.buckets || [];
-  const title = `<h2>大單流向 <span class="muted">五分鐘一格・≥ ${fmt(snap.large_order_lots)} 張</span></h2>`;
+  const title = `<h2>大單流向 <span class="muted">五分鐘一格・≥ ${fmt(snap.large_order_lots)} ${unit}</span></h2>`;
   if (!buckets.length) return `${title}<p class="muted">尚無大單</p>`;
 
   const plotW = CH.w - CH.ml - CH.mr;
@@ -335,7 +336,7 @@ function flowChart(snap) {
          role="img" aria-label="每五分鐘大單買賣張數與股價">
       ${grid}${bars}${line}${notes}${times}${rightTicks}
       <text class="axis-title" x="14" y="${CH.mt + plotH / 2}" text-anchor="middle"
-            transform="rotate(-90 14 ${CH.mt + plotH / 2})">大單張數（張）</text>
+            transform="rotate(-90 14 ${CH.mt + plotH / 2})">大單${unit}數（${unit}）</text>
       <text class="axis-title" x="${CH.w - 12}" y="${CH.mt + plotH / 2}" text-anchor="middle"
             transform="rotate(90 ${CH.w - 12} ${CH.mt + plotH / 2})">股價（元）</text>
       ${hits}
@@ -583,9 +584,27 @@ function restoreScroll(panels, offsets) {
   });
 }
 
+// 期貨分頁（Task 19 D）：單位字樣顯示「口」而非「張」，不顯示歷史K棒圖
+// （stock.historical.candles 對期貨代碼無效，futopt.historical 目前 403），
+// 且期貨連線多半會被拒（帳號只有一條連線配額）——面板不能只是安靜地
+// 全部掛零，要把原因講出來，不然使用者分不出「行情清淡」還是「根本沒接上」。
+function futuresStatusNotice() {
+  const f = state.feed && state.feed.futures;
+  if (!f || f.state === "connected") return "";
+  const reason = {
+    disabled: "期貨追蹤未啟用（啟動時可用 --futures 開啟）",
+    unavailable: `期貨行情不可用：${f.unavailable_reason || "原因不明"}`,
+    reconnecting: "期貨連線中，尚未取得資料…",
+    stopped: "期貨連線已停止",
+  }[f.state] || `期貨連線狀態：${f.state}`;
+  return `<p class="muted" style="color: var(--bad)">⚠ ${esc(reason)}</p>`;
+}
+
 function render() {
   const snap = state.snapshots[state.active];
   if (!snap) return;
+  const futures = snap.market === "futures";
+  const unit = futures ? "口" : "張";
   const panels = document.getElementById("panels");
   const offsets = scrollOffsets(panels);
   const input = document.getElementById("threshold");
@@ -594,31 +613,32 @@ function render() {
   panels.innerHTML = `
     <section>
       <h2>${label(snap)}</h2>
+      ${futures ? futuresStatusNotice() : ""}
       ${snap.subscribed === false ? `<p class="muted" style="color: var(--warn)">
         ⚠ 訂閱尚未獲得伺服器確認，這個分頁暫時不會有任何資料。</p>` : ""}
       <div class="price">${snap.last_price ?? "—"}</div>
       <div class="muted">最新成交 ${clock(snap.last_trade_time)}｜共 ${fmt(snap.trade_count)} 筆</div>
       <table style="margin-top:.5rem">
-        <tr><th>買(外盤)</th><td class="buy">${fmt(snap.totals.buy_lots)} 張</td></tr>
-        <tr><th>賣(內盤)</th><td class="sell">${fmt(snap.totals.sell_lots)} 張</td></tr>
-        <tr><th>集合競價</th><td>${fmt(snap.totals.auction_lots)} 張</td></tr>
-        ${snap.totals.unknown_lots ? `<tr><th>未分類</th><td>${fmt(snap.totals.unknown_lots)} 張</td></tr>` : ""}
+        <tr><th>買(外盤)</th><td class="buy">${fmt(snap.totals.buy_lots)} ${unit}</td></tr>
+        <tr><th>賣(內盤)</th><td class="sell">${fmt(snap.totals.sell_lots)} ${unit}</td></tr>
+        <tr><th>集合競價</th><td>${fmt(snap.totals.auction_lots)} ${unit}</td></tr>
+        ${snap.totals.unknown_lots ? `<tr><th>未分類</th><td>${fmt(snap.totals.unknown_lots)} ${unit}</td></tr>` : ""}
       </table>
       <div style="margin-top:.5rem">
         <label>大單門檻
           <input id="threshold" type="number" min="1" step="1"
                  style="width: 6rem" value="${snap.large_order_lots}">
-          張
+          ${unit}
         </label>
         <button id="apply">套用</button>
         <div class="muted">只影響 ${label(snap)}；各檔可分別設定</div>
       </div>
     </section>
-    <section class="wide">${flowChart(snap)}</section>
-    <section class="wide" id="historyChartBox">${historyChartHTML(state.active)}</section>
+    <section class="wide">${flowChart(snap, unit)}</section>
+    ${futures ? "" : `<section class="wide" id="historyChartBox">${historyChartHTML(state.active)}</section>`}
     <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
-    <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${fmt(snap.large_order_lots)} 張）`)}</section>
-    <section>${tradeTable(snap.recent_trades, "近期成交明細")}</section>`;
+    <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${fmt(snap.large_order_lots)} ${unit}）`)}</section>
+    <section>${tradeTable(snap.recent_trades, "近期成交明細", unit)}</section>`;
 
   restoreScroll(panels, offsets);
   const fresh = document.getElementById("threshold");
@@ -628,7 +648,7 @@ function render() {
   }
   fresh.onkeydown = event => { if (event.key === "Enter") applyThreshold(); };
   document.getElementById("apply").onclick = applyThreshold;
-  bindHistoryChart(state.active);
+  if (!futures) bindHistoryChart(state.active);   // 期貨不顯示歷史K棒，不必打 /api/history
 }
 
 async function applyThreshold() {
@@ -653,8 +673,9 @@ document.addEventListener("mousemove", event => {
   if (flowHit) {
     const snap = state.snapshots[state.active];
     const bucket = snap && (snap.buckets || [])[Number(flowHit.dataset.i)];
+    const unit = snap && snap.market === "futures" ? "口" : "張";
     if (bucket) html = `<b>${hhmm(bucket.t)}–${hhmm(bucket.t + BUCKET_US)}</b><br>
-      買 ${fmt(bucket.buy_lots)} 張<br>賣 ${fmt(bucket.sell_lots)} 張<br>
+      買 ${fmt(bucket.buy_lots)} ${unit}<br>賣 ${fmt(bucket.sell_lots)} ${unit}<br>
       收盤 ${bucket.close}`;
   } else if (histHit) {
     html = historyTipHTML(state.active, Number(histHit.dataset.i));
@@ -677,9 +698,13 @@ function renderTabs() {
     const warn = snap && snap.subscribed === false
       ? `<span class="muted" style="color: var(--warn)" title="訂閱尚未獲得伺服器確認，暫時不會有資料">⚠</span>`
       : "";
+    // 期貨分頁固定由 --futures 決定、無法從畫面上新增或移除（Task 19 D），
+    // 不給移除鈕；點了也只會打中股票專屬的 DELETE /api/symbols 而 404。
+    const isFutures = snap && snap.market === "futures";
+    const removeBtn = isFutures ? ""
+      : `<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button>`;
     return `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
-      warn}${label(snap)
-    }<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button></span>`;
+      warn}${label(snap)}${removeBtn}</span>`;
   }).join("");
   document.querySelectorAll(".tab").forEach(el =>
     el.addEventListener("click", event => {
@@ -770,9 +795,41 @@ document.getElementById("newSymbol").onkeydown = event => {
 // 更新這個狀態——行情真的斷線時，恰好就是不會再有 trade 觸發推播的
 // 時候，只依賴 ws 訊息會讓這個指標在最需要的時候跟著一起凍住。所以另外
 // 用一個獨立的輪詢，直接問伺服器 GET /api/feed。
-function renderFeedStatus(feed) {
+// Task 19：/api/feed 與 ws 的 "feed" 欄位是兩段式 {stock, futures}——股票與
+// 期貨是各自獨立的連線，健康度不能合併成一個指標，不然使用者分不出是哪
+// 一條斷了。這裡拆成兩個小函式各自更新畫面上對應的區塊。
+function renderFeedStatus(combined) {
+  if (!combined) return;
+  state.feed = combined;
+  renderStockStatus(combined.stock);
+  renderFuturesStatus(combined.futures);
+}
+
+// 期貨連線健康度：獨立的一小行文字，不搶股票主狀態列的版面——這把 key
+// 上期貨幾乎必然是 unavailable（見 app/futures.py 檔頭的實測結果），要讓
+// 使用者一眼看到原因，又不能讓它蓋過「股票行情正常」這個更重要的訊號。
+function renderFuturesStatus(feed) {
+  const el = document.getElementById("futStatus");
+  if (!el || !feed) return;
+  if (feed.state === "disabled") {
+    el.textContent = "期貨：未啟用";
+    el.title = "";
+  } else if (feed.state === "connected") {
+    el.textContent = "期貨：行情正常";
+    el.title = "";
+  } else if (feed.state === "unavailable") {
+    el.textContent = "期貨：不可用";
+    el.title = feed.unavailable_reason || "原因不明";
+  } else {
+    el.textContent = feed.reconnects > 0
+      ? `期貨：連線中（第 ${feed.reconnects} 次重試）`
+      : "期貨：連線中…";
+    el.title = "";
+  }
+}
+
+function renderStockStatus(feed) {
   if (!feed) return;
-  state.feed = feed;
   const usage = document.getElementById("subUsage");
   if (usage && feed.subscription_limit != null) {
     usage.textContent = `訂閱 ${feed.subscription_count}/${feed.subscription_limit}`;

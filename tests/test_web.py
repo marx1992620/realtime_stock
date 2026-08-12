@@ -180,26 +180,59 @@ class FakeFeed:
 
 
 def test_feed_status_is_exposed_via_rest_and_ws_messages():
+    """Task 19：/api/feed 與 ws 的 "feed" 欄位改成兩段式
+    {"stock": ..., "futures": ...}——股票與期貨是兩條獨立連線，健康度不能
+    合併成一個欄位，不然使用者分不出是哪一條斷了。"""
     state = MarketState(["2330"], large_order_lots=5)
     feed = FakeFeed(state="reconnecting", reconnects=2)
     client = TestClient(create_app(state, Broadcaster(), feed))
 
     body = client.get("/api/feed").json()
-    assert body == {"state": "reconnecting", "last_message_ago": 1.5,
-                    "reconnects": 2, "subscription_errors": [],
-                    "subscription_count": 1, "subscription_limit": 5}
+    assert body["stock"] == {"state": "reconnecting", "last_message_ago": 1.5,
+                             "reconnects": 2, "subscription_errors": [],
+                             "subscription_count": 1, "subscription_limit": 5}
+    # 沒有接 futures_feed（create_app 的選配參數）視為停用，不是「還沒連上」。
+    assert body["futures"]["state"] == "disabled"
 
     with client.websocket_connect("/ws") as ws:
         first = ws.receive_json()
-    assert first["feed"]["state"] == "reconnecting"
-    assert first["feed"]["reconnects"] == 2
+    assert first["feed"]["stock"]["state"] == "reconnecting"
+    assert first["feed"]["stock"]["reconnects"] == 2
+    assert first["feed"]["futures"]["state"] == "disabled"
 
 
 def test_feed_status_defaults_to_stopped_when_no_feed_given():
     """create_app 的 feed 參數是選配的（許多測試不需要真的接一個 FugleFeed
     進來）；沒給時 /api/feed 仍要回一個合理的預設值，不是少個欄位或整個 500。"""
     _, client = build()
-    assert client.get("/api/feed").json()["state"] == "stopped"
+    body = client.get("/api/feed").json()
+    assert body["stock"]["state"] == "stopped"
+    assert body["futures"]["state"] == "disabled"
+
+
+# -- 期貨（Task 19 D）：股票與期貨併存在同一份快照/門檻/連線健康度管道 ------
+
+def test_futures_snapshot_and_threshold_route_to_the_futures_state():
+    """期貨走獨立的 MarketState，但共用同一批端點——依代碼判斷該去哪一份
+    state，不是另開一組平行端點（見 app/web.py 的 _lookup_market）。"""
+    state = MarketState(["2330"], large_order_lots=5)
+    futures_state = MarketState(["TXFR1"], large_order_lots=10, names={"TXFR1": "台指期"})
+    client = TestClient(create_app(state, Broadcaster(), futures_state=futures_state))
+
+    body = client.get("/api/snapshot/TXFR1").json()
+    assert body["market"] == "futures"
+    assert body["name"] == "台指期"
+
+    response = client.post("/api/threshold", json={"large_order_lots": 3, "symbol": "TXFR1"})
+    assert response.status_code == 200
+    assert response.json()["thresholds"] == {"2330": 5, "TXFR1": 3}
+    assert futures_state.snapshot("TXFR1")["large_order_lots"] == 3
+    assert state.snapshot("2330")["large_order_lots"] == 5, "不該波及股票的門檻"
+
+    with client.websocket_connect("/ws") as ws:
+        first = ws.receive_json()
+    assert first["snapshots"]["TXFR1"]["market"] == "futures"
+    assert first["snapshots"]["2330"]["market"] == "stock"
 
 
 def test_websocket_init_carries_every_threshold():

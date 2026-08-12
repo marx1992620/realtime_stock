@@ -12,15 +12,20 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Callable
 
 import uvicorn
 
 import collector                       # 沿用既有的 .env 載入器
 from app.feed import MAX_SUBSCRIPTIONS, FugleFeed
+from app.futures import DEFAULT_FUTURES_SYMBOL, FuturesFeed, futures_trade_value_twd
 from app.storage import ParquetTradeWriter, output_path
 from app.web import Broadcaster, MarketState, create_app
 
 DEFAULT_LARGE_ORDER_LOTS = 10
+# 期貨大單門檻預設值與股票剛好同為 10，但語意不同（口 vs 張），刻意分開
+# 一個常數，改其中一個不會意外影響另一個（Task 19 D）。
+DEFAULT_FUTURES_LARGE_ORDER_LOTS = 10
 
 
 class Pipeline:
@@ -39,7 +44,8 @@ class Pipeline:
     def __init__(self, state: MarketState, broadcaster: Broadcaster,
                  writers: dict[str, ParquetTradeWriter],
                  output_dir: Path | None = None, date_str: str | None = None,
-                 run_id: str | None = None) -> None:
+                 run_id: str | None = None,
+                 value_twd_fn: Callable[[dict], float] | None = None) -> None:
         self.state = state
         self.broadcaster = broadcaster
         self.writers = writers
@@ -49,6 +55,16 @@ class Pipeline:
         self.date_str = date_str
         self.run_id = run_id
         self._writers_lock = threading.Lock()
+        # 期貨專用（Task 19 C）：SymbolAggregator.add_trade 內部一律用
+        # app.classify.trade_value_twd（股票的 price*lots*1000）算 value_twd，
+        # 不該為了期貨的契約乘數去改 aggregator.py。給這個 pipeline 一個
+        # 專屬 Pipeline 實例，傳入一個包住
+        # app.futures.futures_trade_value_twd(price, size) 的函式（接收原始
+        # trade dict，回傳金額）；record_trade 拿到的紀錄物件是
+        # aggregator.trades 裡的同一個 dict，這裡就地覆寫 value_twd 即可，
+        # 股票用的 Pipeline 完全不受影響（不傳這個參數，行為與 Task 19 之前
+        # 完全一樣）。
+        self.value_twd_fn = value_twd_fn
 
     def handle_trade(self, trade: dict) -> None:
         # 走 MarketState 的加鎖寫入口：這個回呼在 Fugle SDK 的執行緒上，
@@ -56,6 +72,8 @@ class Pipeline:
         record = self.state.record_trade(trade)
         if record is None:            # 未追蹤代碼，或重複 serial
             return
+        if self.value_twd_fn is not None:
+            record["value_twd"] = self.value_twd_fn(trade)
         with self._writers_lock:
             writer = self.writers.get(record["symbol"])
         if writer is not None:
@@ -213,6 +231,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--include-trials", action="store_true",
                         help="一併記錄開盤前試撮")
+    # 期貨（Task 19 D）：預設就是訂閱 TXFR1（使用者要求設為預設訂閱）；
+    # 傳空字串 --futures "" 停用。與 --symbols 不同，這裡故意不用
+    # _symbol_list 那個「不可為空」的型別——空字串在這裡是合法的「停用」訊號，
+    # 不是打錯。走獨立的第二條 WebSocket 連線，不佔股票的 MAX_SUBSCRIPTIONS
+    # 訂閱預算。
+    parser.add_argument("--futures", default=DEFAULT_FUTURES_SYMBOL,
+                        help=f"台指期合約代碼，預設 {DEFAULT_FUTURES_SYMBOL}"
+                             "（依需求為預設訂閱）。傳空字串 --futures \"\" 可停用。")
+    parser.add_argument("--futures-large-order",
+                        type=lambda raw: _lots(raw, "期貨大單門檻"),
+                        default=DEFAULT_FUTURES_LARGE_ORDER_LOTS,
+                        help="期貨大單門檻（口），預設 "
+                             f"{DEFAULT_FUTURES_LARGE_ORDER_LOTS} 口")
     args = parser.parse_args(argv)
 
     # 逐檔門檻要對上 --symbols 才知道是否齊備，這只能在兩個參數都解析完之後做。
@@ -235,6 +266,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(
             f"股票代碼數 {used} 超過訂閱上限 {MAX_SUBSCRIPTIONS}"
             "（每檔股票佔 1 個訂閱）。請減少 --symbols。")
+
+    args.futures = args.futures.strip()
     return args
 
 
@@ -269,11 +302,37 @@ def main(argv: list[str] | None = None) -> None:
     print(f"追蹤 {', '.join(labels[s] for s in args.symbols)}"
           f"｜大單門檻（張）{thresholds}"
           f"｜訂閱數 {len(args.symbols)}/{MAX_SUBSCRIPTIONS}", flush=True)
+
+    # 期貨（Task 19）：獨立的第二條 WebSocket 連線、獨立的 MarketState、
+    # 獨立的 Pipeline，彼此互不共享狀態——期貨連線失敗絕不可影響股票行情，
+    # 見 app/futures.py 檔頭的設計決策說明。--futures "" 表示停用，三個物件
+    # 都保持 None，create_app 與畫面會顯示「未啟用」而不是空白/出錯的面板。
+    futures_symbol = args.futures
+    futures_state: MarketState | None = None
+    futures_pipeline: Pipeline | None = None
+    futures_feed: FuturesFeed | None = None
+    if futures_symbol:
+        futures_state = MarketState([futures_symbol],
+                                    large_order_lots=args.futures_large_order,
+                                    names={futures_symbol: "台指期"})
+        futures_writers = build_writers(args.output_dir, today, [futures_symbol], run_id)
+        futures_pipeline = Pipeline(
+            futures_state, broadcaster, futures_writers,
+            output_dir=args.output_dir, date_str=today, run_id=run_id,
+            value_twd_fn=lambda trade: futures_trade_value_twd(trade["price"], trade["size"]))
+        futures_feed = FuturesFeed(api_key, futures_symbol, futures_pipeline.handle_trade)
+        threading.Thread(target=futures_feed.run, daemon=True).start()
+        print(f"期貨訂閱 {futures_symbol}｜大單門檻（口）{args.futures_large_order}"
+              "｜連線失敗不影響股票行情，詳見畫面上的期貨分頁", flush=True)
+    else:
+        print("期貨追蹤已停用（--futures \"\"）", flush=True)
+
     print(f"看盤畫面 http://{args.host}:{args.port}", flush=True)
     app = create_app(state, broadcaster, feed, pipeline=pipeline,
                      lookup_name=functools.partial(lookup_symbol_name, api_key),
                      default_large_order_lots=DEFAULT_LARGE_ORDER_LOTS,
-                     history_api_key=api_key)
+                     history_api_key=api_key,
+                     futures_feed=futures_feed, futures_state=futures_state)
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     except KeyboardInterrupt:
@@ -282,7 +341,11 @@ def main(argv: list[str] | None = None) -> None:
         # 先停 feed 再關 writer：關閉順序反過來的話，重連迴圈或補資料還可能
         # 在 writer.close() 之後繼續呼叫 handle_trade，寫進已經關閉的檔案。
         feed.stop()
+        if futures_feed is not None:
+            futures_feed.stop()
         pipeline.close()
+        if futures_pipeline is not None:
+            futures_pipeline.close()
         print("\n已停止，資料已寫入 " + str(args.output_dir), flush=True)
 
 

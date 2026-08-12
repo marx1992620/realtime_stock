@@ -31,6 +31,11 @@ subscribed 事件回傳的 id（{"id": ...}）才會被接受。因此：
   正常：self._pending_subscribe 記下最近一次送出訂閱的代碼，被拒時標記進
   self._subscribe_failed；subscribed_symbols / failed_subscriptions 讓上層
   （web.py 的 POST /api/symbols）能等待確認、逾時或失敗就回滾。
+
+期貨（Task 19）：app/futures.py 的 FuturesFeed 複製了這裡的重連／看門狗／
+訂閱 id 機制（刻意複製而非共用基底，理由見該檔開頭），但重試語意不同——
+連續失敗達上限就永久停止，不像這裡無限重試。修改這裡的連線韌性邏輯時，
+記得檢查 FuturesFeed 是否也要同步修正。
 """
 
 from __future__ import annotations
