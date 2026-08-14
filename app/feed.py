@@ -32,10 +32,9 @@ subscribed 事件回傳的 id（{"id": ...}）才會被接受。因此：
   self._subscribe_failed；subscribed_symbols / failed_subscriptions 讓上層
   （web.py 的 POST /api/symbols）能等待確認、逾時或失敗就回滾。
 
-期貨（Task 19）：app/futures.py 的 FuturesFeed 複製了這裡的重連／看門狗／
-訂閱 id 機制（刻意複製而非共用基底，理由見該檔開頭），但重試語意不同——
-連續失敗達上限就永久停止，不像這裡無限重試。修改這裡的連線韌性邏輯時，
-記得檢查 FuturesFeed 是否也要同步修正。
+期貨與這裡完全無關：台指期改由 app/futures.py 輪詢期交所 MIS 取即時價格與
+1 分 K（免金鑰、獨立執行緒），不佔這條連線的 MAX_SUBSCRIPTIONS 預算，也
+沒有逐筆成交。這支檔案只服務股票。
 """
 
 from __future__ import annotations
@@ -55,6 +54,27 @@ MAX_SUBSCRIPTIONS = 5
 MAX_BACKOFF_SECONDS = 30.0
 BACKFILL_PAGE_SIZE = 500
 
+# 單次連線嘗試的上限秒數。SDK 在 socket open 之後自己有 5 秒的認證逾時，這裡
+# 只需要涵蓋「socket 根本沒開起來」的情況，抓寬一點不會誤殺正常的慢連線。
+CONNECT_TIMEOUT_SECONDS = 20.0
+
+# 放棄一次連線嘗試後，等待 SDK 那條執行緒收工的上限秒數。
+ABANDON_JOIN_SECONDS = 5.0
+
+
+def _unauthenticated_auth_status() -> int:
+    """SDK 的 AuthenticationState.UNAUTHENTICATED。
+
+    拿真的列舉值，取不到才退回實測數值 3（PENDING=0、AUTHENTICATING=1、
+    AUTHENTICATED=2、UNAUTHENTICATED=3）——測試把整個 fugle_marketdata 換成
+    假模組，那裡沒有 websocket 子模組。
+    """
+    try:
+        from fugle_marketdata.websocket.client import AuthenticationState
+        return AuthenticationState.UNAUTHENTICATED
+    except Exception:                                 # noqa: BLE001 - 取不到就用實測值
+        return 3
+
 _PARSE_ERRORS = (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError)
 
 
@@ -62,7 +82,8 @@ class FugleFeed:
     def __init__(self, api_key: str, symbols: list[str],
                  on_trade: Callable[[dict], None],
                  include_trials: bool = False,
-                 stale_after_seconds: float = 90.0) -> None:
+                 stale_after_seconds: float = 90.0,
+                 connect_timeout_seconds: float = CONNECT_TIMEOUT_SECONDS) -> None:
         self.api_key = api_key
         self.symbols = list(symbols)
         self.on_trade = on_trade
@@ -86,6 +107,9 @@ class FugleFeed:
 
         # -- 連線韌性狀態（Task 13）------------------------------------
         self.stale_after_seconds = stale_after_seconds
+        self.connect_timeout_seconds = connect_timeout_seconds
+        # 連線嘗試進行中：看門狗在這段期間必須讓開，見 _watchdog_tick。
+        self._connecting = False
         self.last_message_at: float | None = None
         self.reconnects = 0
         # 尚未連上也算「還在嘗試連線」，狀態機只有三種值，沒有第四種給
@@ -277,7 +301,7 @@ class FugleFeed:
             self._stock = stock
 
             try:
-                stock.connect()
+                self._connect_with_timeout(stock)
             except Exception as error:            # noqa: BLE001 - 任何連線失敗都要能重試
                 print(f"連線失敗：{type(error).__name__}: {error}",
                       file=sys.stderr, flush=True)
@@ -287,8 +311,12 @@ class FugleFeed:
             else:
                 self._state = "connected"
                 backoff = 1.0
-                if self.reconnects > 0:
-                    self._backfill()
+                # 每次連上都補，包含第一次。曾經只在 reconnects > 0 才補，
+                # 結果盤中重啟（例如修好卡死之後）只會從當下開始收，開盤到
+                # 重啟之間那幾個小時的成交在畫面與 parquet 上都是空的。
+                # SymbolAggregator 以 serial 去重，重複餵進去不會重算也不會
+                # 重複落檔（Pipeline.handle_trade 對 None 直接返回）。
+                self._backfill()
 
             self._wake_event.wait()
             if self._stop_event.is_set():
@@ -304,6 +332,69 @@ class FugleFeed:
                 break
 
         self._state = "stopped"
+
+    # -- 有界的連線嘗試（Task 20）-------------------------------------------
+    def _connect_with_timeout(self, stock) -> None:
+        """呼叫 SDK 的 connect()，但不容許它永遠不返回。
+
+        為什麼要包一層：SDK 的 connect() 是
+        ``Thread(run_forever).start()`` 之後接一個**沒有 sleep 的**
+        ``while True: if auth_status in [AUTHENTICATED, UNAUTHENTICATED]: break``。
+        auth_status 只有在 socket 真的 open、觸發 connect 事件、跑進
+        __authenticate() 之後才會離開 PENDING。socket 從頭到尾沒開起來時
+        （實地事故：2026-08-13 16:09），那個迴圈永遠不會 break —— 不返回、
+        也不拋例外，run() 的重連迴圈就整個死在這一行，一條執行緒燒滿一顆
+        核心 17 小時，隔天開盤完全沒有資料。
+
+        所以把 connect() 丟到另一條執行緒、只等 connect_timeout_seconds；
+        逾時就放棄那個 client，往外拋 TimeoutError 讓 run() 照常退避重試。
+        """
+        failure: list[BaseException] = []
+        done = threading.Event()
+
+        def attempt() -> None:
+            try:
+                stock.connect()
+            except BaseException as error:        # noqa: BLE001 - 原樣帶回主執行緒
+                failure.append(error)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=attempt, daemon=True, name="feed-connect")
+        self._connecting = True
+        try:
+            thread.start()
+            if not done.wait(timeout=self.connect_timeout_seconds):
+                self._abandon_connect(stock, thread)
+                raise TimeoutError(
+                    f"連線嘗試逾時（{self.connect_timeout_seconds:.0f} 秒）"
+                    "，放棄這個 client 並重試")
+        finally:
+            self._connecting = False
+        if failure:
+            raise failure[0]
+
+    def _abandon_connect(self, stock, thread: threading.Thread) -> None:
+        """解開 SDK 卡死的 busy-wait，回收那條執行緒。
+
+        auth_status 是 SDK 上的普通公開屬性，設成 UNAUTHENTICATED 正是那個
+        迴圈的其中一個離開條件。**順序很重要**：一定要等 connect() 真的返回
+        之後才呼叫 disconnect() —— SDK 的 disconnect() 最後一行是
+        ``auth_status = PENDING``，先叫它只會把迴圈推回卡死的狀態。
+        """
+        stock.auth_status = _unauthenticated_auth_status()
+        thread.join(timeout=ABANDON_JOIN_SECONDS)
+        if thread.is_alive():
+            # 走到這裡代表 SDK 的形狀變了、解不開。留一條燒 CPU 的執行緒總比
+            # 整條行情死掉好，但必須讓人看得見。
+            print("警告：放棄的連線執行緒沒有結束，可能持續佔用 CPU",
+                  file=sys.stderr, flush=True)
+            return
+        try:
+            stock.disconnect()
+        except Exception as error:                # noqa: BLE001 - 清理失敗不影響重試
+            print(f"清理放棄的連線時失敗：{type(error).__name__}: {error}",
+                  file=sys.stderr, flush=True)
 
     # -- 存活偵測（B）------------------------------------------------------
     def _start_watchdog(self) -> None:
@@ -327,6 +418,11 @@ class FugleFeed:
     def _watchdog_tick(self) -> None:
         """檢查一次是否閒置過久；抽成方法方便測試不必真的等 90 秒。"""
         if self.last_message_at is None:
+            return
+        if self._connecting:
+            # 連線嘗試進行中不要插手：SDK 的 disconnect() 會把 auth_status 設回
+            # PENDING，那正是讓 connect() 的 busy-wait 永遠不 break 的值，跟
+            # _abandon_connect 互相打架。這段期間的逾時由 connect 逾時負責。
             return
         idle = time.monotonic() - self.last_message_at
         if idle > self.stale_after_seconds:
@@ -415,12 +511,11 @@ class FugleFeed:
 
     # -- 斷線補資料（D）-----------------------------------------------------
     def _backfill(self) -> None:
-        """重連成功後，用 REST 把重連期間可能漏掉的成交補回 on_trade。
+        """連上之後用 REST 把當日已經發生、但這條連線沒收到的成交補回 on_trade。
 
-        只在 run() 判斷 reconnects > 0 時才會被呼叫，程式一開始的第一次連線
-        不會多打這輪 REST。serial 去重已經在 SymbolAggregator.add_trade，
-        整批餵進去是安全的，不需要精算漏了哪一段。任何失敗都不可讓行情
-        跟著死掉。
+        每次連上都跑，含第一次連線——盤中重啟時，開盤到啟動之間的成交只能
+        靠這輪補回來。serial 去重已經在 SymbolAggregator.add_trade，整批餵
+        進去是安全的，不需要精算漏了哪一段。任何失敗都不可讓行情跟著死掉。
         """
         try:
             from fugle_marketdata import RestClient

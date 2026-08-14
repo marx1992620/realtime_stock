@@ -210,29 +210,57 @@ def test_feed_status_defaults_to_stopped_when_no_feed_given():
     assert body["futures"]["state"] == "disabled"
 
 
-# -- 期貨（Task 19 D）：股票與期貨併存在同一份快照/門檻/連線健康度管道 ------
+# -- 期貨：獨立的唯讀端點，不與股票的快照／門檻管道混在一起 -----------------
 
-def test_futures_snapshot_and_threshold_route_to_the_futures_state():
-    """期貨走獨立的 MarketState，但共用同一批端點——依代碼判斷該去哪一份
-    state，不是另開一組平行端點（見 app/web.py 的 _lookup_market）。"""
+class FakePoller:
+    """期交所 MIS 輪詢器的最小替身（app.futures.TaifexFuturesPoller）。"""
+
+    def __init__(self, quote=None, state="connected"):
+        self._quote = quote
+        self._state = state
+
+    def snapshot(self):
+        return self._quote
+
+    def status(self):
+        return {"state": self._state, "last_message_ago": 2.0, "reconnects": 0,
+                "unavailable_reason": None, "last_error": None,
+                "symbol": "TXFH6-F", "name": "臺指期086"}
+
+
+def test_futures_endpoint_returns_the_quote_and_its_own_status():
+    """期貨不再是第二份 MarketState：它沒有逐筆成交可以聚合，形狀與股票
+    快照完全不同，所以走自己的 GET /api/futures，而不是擠進
+    /api/snapshot/{symbol}（見 app/web.py 的 create_app 說明）。"""
+    quote = {"symbol": "TXFH6-F", "name": "臺指期086", "last_price": 46010.0,
+             "candles": [{"date": "08:46", "open": 1, "high": 2, "low": 0, "close": 1,
+                          "volume": 10}], "ma": {"5": [None]}, "bar_unit": "分"}
     state = MarketState(["2330"], large_order_lots=5)
-    futures_state = MarketState(["TXFR1"], large_order_lots=10, names={"TXFR1": "台指期"})
-    client = TestClient(create_app(state, Broadcaster(), futures_state=futures_state))
+    client = TestClient(create_app(state, Broadcaster(), futures_poller=FakePoller(quote)))
 
-    body = client.get("/api/snapshot/TXFR1").json()
-    assert body["market"] == "futures"
-    assert body["name"] == "台指期"
+    body = client.get("/api/futures").json()
+    assert body["enabled"] is True
+    assert body["quote"]["last_price"] == 46010.0
+    assert body["status"]["state"] == "connected"
+    assert client.get("/api/feed").json()["futures"]["state"] == "connected"
 
-    response = client.post("/api/threshold", json={"large_order_lots": 3, "symbol": "TXFR1"})
-    assert response.status_code == 200
-    assert response.json()["thresholds"] == {"2330": 5, "TXFR1": 3}
-    assert futures_state.snapshot("TXFR1")["large_order_lots"] == 3
-    assert state.snapshot("2330")["large_order_lots"] == 5, "不該波及股票的門檻"
-
+    # 期貨代碼不在股票那份 state 裡，股票專屬的端點要乾脆地回 404，
+    # 不可以回一個看起來像有資料的空快照。
+    assert client.get("/api/snapshot/TXFH6-F").status_code == 404
     with client.websocket_connect("/ws") as ws:
         first = ws.receive_json()
-    assert first["snapshots"]["TXFR1"]["market"] == "futures"
-    assert first["snapshots"]["2330"]["market"] == "stock"
+    assert list(first["snapshots"]) == ["2330"]
+
+
+def test_futures_endpoint_reports_disabled_when_no_poller_is_attached():
+    """--futures "" 停用時畫面要說得出「未啟用」，而不是留一塊空白面板
+    或當成「連線中」讓使用者一直等。"""
+    _, client = build()
+    body = client.get("/api/futures").json()
+    assert body == {"enabled": False, "quote": None,
+                    "status": {"state": "disabled", "last_message_ago": None,
+                               "reconnects": 0, "unavailable_reason": None,
+                               "last_error": None, "symbol": None, "name": None}}
 
 
 def test_websocket_init_carries_every_threshold():
@@ -764,3 +792,69 @@ def test_get_history_without_api_key_configured_is_500():
     client = TestClient(create_app(state, Broadcaster(),
                                    lookup_name=lambda symbol: "台積電"))
     assert client.get("/api/history/2330").status_code == 500
+
+
+class FakeDailyPoller(FakePoller):
+    """帶 product 的替身：/api/futures/daily 用它決定要查哪個商品。"""
+    product = "TXF"
+
+
+def test_futures_daily_endpoint_serves_the_cached_daily_candles(monkeypatch):
+    """日 K 與即時報價分成兩支端點：日 K 一天只變一次、一份約 250 根，
+    塞進每 5 秒輪詢的 /api/futures 等於每小時重傳 720 遍同樣的東西。"""
+    import app.web as web
+    calls = []
+    monkeypatch.setattr(web.DailyCandleCache, "get",
+                        lambda self, product, *a, **k: calls.append(product) or {
+                            "symbol": product, "name": "TXF 連續近月", "bar_unit": "日",
+                            "candles": [{"date": "2026-08-12", "open": 45350.0,
+                                         "high": 45561.0, "low": 45156.0,
+                                         "close": 45528.0, "volume": 48409.0}],
+                            "ma": {"5": [None]}})
+    state = MarketState(["2330"], large_order_lots=5)
+    client = TestClient(create_app(state, Broadcaster(),
+                                   futures_poller=FakeDailyPoller()))
+
+    body = client.get("/api/futures/daily").json()
+    assert calls == ["TXF"]
+    assert body["bar_unit"] == "日"
+    assert body["candles"][0]["close"] == 45528.0
+
+
+def test_futures_daily_endpoint_404s_when_futures_is_disabled():
+    _, client = build()
+    assert client.get("/api/futures/daily").status_code == 404
+
+
+# -- 關閉時的收尾（實地事故）-------------------------------------------------
+#
+# 實測 uvicorn 0.52.1：收到 SIGTERM 之後它會做完整的優雅關閉（Shutting down →
+# lifespan shutdown → Finished server process），但**不會從 uvicorn.run() 返回**
+# ——其後的 finally 不執行，atexit 也不執行。收尾原本掛在 main() 的 finally，
+# 於是 ParquetTradeWriter.close() 從來沒被呼叫過，每個 parquet 都停在沒有 footer
+# 的 .partial：2026-08-12、08-13 兩個交易日的逐筆資料因此整批讀不出來。
+#
+# 唯一在 SIGTERM 下還活著的鉤子是 lifespan shutdown，收尾必須掛在那裡。
+
+def test_lifespan_shutdown_stops_feeds_then_closes_writers():
+    calls = []
+    feed = types.SimpleNamespace(stop=lambda: calls.append("feed"))
+    poller = types.SimpleNamespace(stop=lambda: calls.append("futures"))
+    pipeline = types.SimpleNamespace(close=lambda: calls.append("pipeline"))
+
+    app = create_app(MarketState(["2330"], large_order_lots=5), Broadcaster(),
+                     feed, pipeline=pipeline, futures_poller=poller)
+    with TestClient(app):
+        assert calls == [], "還在服務中就不該收尾"
+
+    assert calls == ["feed", "futures", "pipeline"], (
+        "順序必須是先停行情、再關 writer——反過來的話，重連迴圈或補資料還可能"
+        f"在 close() 之後繼續寫進已關閉的檔案：{calls}")
+
+
+def test_lifespan_shutdown_works_without_the_optional_collaborators():
+    """feed／pipeline／futures_poller 都是選配的（測試常常不給），關閉時
+    不能因為它們是 None 就炸掉——那會讓整個 app 連乾淨結束都做不到。"""
+    app = create_app(MarketState(["2330"], large_order_lots=5), Broadcaster())
+    with TestClient(app):
+        pass

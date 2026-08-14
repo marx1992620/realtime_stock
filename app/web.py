@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -22,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.aggregator import SymbolAggregator
 from app.feed import MAX_SUBSCRIPTIONS
-from app.futures import MAX_FUTURES_SUBSCRIPTIONS
+from app.futures import DailyCandleCache, TaifexError
 from app.history import HistoryCache, HistoryError
 
 _STATIC = Path(__file__).resolve().parent / "static"
@@ -217,17 +218,27 @@ def _feed_status(feed, limit: int = MAX_SUBSCRIPTIONS, *, disabled_state: str = 
     return payload
 
 
-def _combined_feed_status(feed, futures_feed) -> dict:
-    """GET /api/feed 與 ws 的 "feed" 欄位改成兩段式（Task 19 D）：
-    {"stock": ..., "futures": ...}，畫面才能分別顯示兩條連線各自的健康度、
-    分別判斷該不該顯示「期貨行情不可用：<原因>」。futures_feed 是 None 時
-    （--futures "" 停用，或 create_app 沒收到這個參數的舊測試）一律回
-    disabled_state="disabled"，不會跟股票的 "stopped" 混淆。
-    """
+def _futures_status(poller) -> dict:
+    """期貨那一段的健康度。期貨改走期交所 MIS 輪詢（見 app/futures.py 檔頭）
+    之後不再有「訂閱」的概念，所以不套用 _feed_status ——那個函式帶的
+    subscription_count／subscription_limit 對輪詢沒有意義，硬填一個數字只
+    會讓畫面顯示一個不存在的配額。poller 是 None（--futures "" 停用，或
+    create_app 沒收到這個參數的測試）時回 "disabled"，與股票的 "stopped"
+    區分得開。"""
+    if poller is None:
+        return {"state": "disabled", "last_message_ago": None, "reconnects": 0,
+                "unavailable_reason": None, "last_error": None,
+                "symbol": None, "name": None}
+    return poller.status()
+
+
+def _combined_feed_status(feed, futures_poller) -> dict:
+    """GET /api/feed 與 ws 的 "feed" 欄位是兩段式：{"stock": ..., "futures": ...}
+    ——股票（Fugle WebSocket）與期貨（期交所 MIS 輪詢）是兩條性質完全不同
+    的資料流，健康度不能合併成一個指標，不然使用者分不出是哪一邊斷了。"""
     return {
         "stock": _feed_status(feed, MAX_SUBSCRIPTIONS),
-        "futures": _feed_status(futures_feed, MAX_FUTURES_SUBSCRIPTIONS,
-                                disabled_state="disabled"),
+        "futures": _futures_status(futures_poller),
     }
 
 
@@ -266,8 +277,7 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
                lookup_name: Callable[[str], str | None] | None = None,
                default_large_order_lots: int | None = None,
                history_api_key: str | None = None,
-               futures_feed=None,
-               futures_state: MarketState | None = None) -> FastAPI:
+               futures_poller=None) -> FastAPI:
     """pipeline／lookup_name 都是選配的協作物件，讓新增／移除標的的端點能
     分別建立與關閉該代碼的 writer（pipeline.add_writer/remove_writer）、
     以 REST 查名稱（lookup_name）——兩者都注入而不是寫死 import，這樣
@@ -279,49 +289,47 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
     （測試常常不需要這個端點）。HistoryCache 在這裡建立、每個 create_app
     各一份，測試裡的每個 build() 因此天然互不污染彼此的快取。
 
-    futures_feed／futures_state 是 Task 19 加的、同樣選配：期貨走完全獨立
-    的第二條連線與第二份 MarketState（不是塞進同一份 state——股票的
-    POST/DELETE /api/symbols、訂閱預算檢查都是股票專屬邏輯，期貨代碼混進
-    同一份清單只會讓那些端點的語意變得含糊）。/api/snapshot/{symbol}、
-    /api/threshold 與 /ws 的推播會依代碼所屬市場自動路由到對的那一份
-    state／feed，見下方 _lookup_market。"""
+    futures_poller 同樣選配：期貨已改成「只要即時價格與 K 線」，資料走
+    期交所 MIS 輪詢（見 app/futures.py 檔頭），與股票沒有任何共用狀態，
+    也不再有逐筆成交可以聚合——所以它**不**是第二份 MarketState，而是一個
+    只出不進的快照來源，畫面另外用 GET /api/futures 取。這麼切的好處是
+    股票這一側（/ws 推播、大單門檻、動態增減標的、POST/DELETE
+    /api/symbols）完全回到期貨出現之前的單純樣子，不必再逐個端點判斷
+    「這個代碼屬於哪個市場」。"""
     history_cache = HistoryCache()
-
-    def _lookup_market(symbol: str):
-        """依代碼判斷它屬於股票還是期貨，回傳 (state, feed, market) 三元組；
-        兩邊都沒追蹤則回 (None, None, None)。這是同步呼叫（會取
-        MarketState 的鎖），呼叫端若在事件迴圈上（/ws）必須包在
-        asyncio.to_thread 裡，不可直接呼叫。"""
-        if state.has_symbol(symbol):
-            return state, feed, "stock"
-        if futures_state is not None and futures_state.has_symbol(symbol):
-            return futures_state, futures_feed, "futures"
-        return None, None, None
+    futures_daily_cache = DailyCandleCache()
 
     def _all_market_snapshots() -> dict:
-        """合併股票與期貨快照給 /ws 的 init 用，並標註各自的 market 與
-        subscribed 狀態——期貨的訂閱確認要看 futures_feed，不能跟股票共用
-        同一個 feed 物件判斷（見 _annotate_subscribed）。"""
-        combined = {symbol: {**_annotate_subscribed(snap, symbol, feed), "market": "stock"}
-                   for symbol, snap in state.snapshot_all().items()}
-        if futures_state is not None:
-            combined.update({
-                symbol: {**_annotate_subscribed(snap, symbol, futures_feed), "market": "futures"}
-                for symbol, snap in futures_state.snapshot_all().items()
-            })
-        return combined
+        return {symbol: {**_annotate_subscribed(snap, symbol, feed), "market": "stock"}
+                for symbol, snap in state.snapshot_all().items()}
 
-    def _all_thresholds() -> dict:
-        combined = dict(state.thresholds)
-        if futures_state is not None:
-            combined.update(futures_state.thresholds)
-        return combined
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 廣播器要在事件迴圈起來後才能綁定。使用 lifespan 而非
         # @app.on_event("startup")：後者在 FastAPI 0.109+ 已棄用。
         broadcaster.bind_loop(asyncio.get_running_loop())
         yield
+        # 收尾必須掛在這裡，不能掛在呼叫端 uvicorn.run() 之後的 finally。
+        # 實測 uvicorn 0.52.1：SIGTERM 之後它會做完整的優雅關閉（Shutting
+        # down → 這個 lifespan shutdown → Finished server process），然後
+        # **不從 uvicorn.run() 返回**——finally 不執行，atexit 也不執行。
+        # 收尾原本就掛在 main() 的 finally，於是 ParquetTradeWriter.close()
+        # 從來沒被呼叫過，每個 parquet 都停在沒有 footer 的 .partial，
+        # 2026-08-12、08-13 兩個交易日的逐筆資料整批讀不出來。
+        #
+        # 順序不可對調：先停行情來源，最後才關 writer。反過來的話，重連
+        # 迴圈或斷線補資料還可能在 close() 之後繼續送進成交，寫入已經關閉
+        # 的檔案（storage.py 的 append 會擋下來只計數，但不該依賴那道保護）。
+        for label, collaborator, method in (("feed", feed, "stop"),
+                                             ("futures", futures_poller, "stop"),
+                                             ("pipeline", pipeline, "close")):
+            if collaborator is None:            # 三者都是選配，測試常常不給
+                continue
+            try:
+                getattr(collaborator, method)()
+            except Exception as error:          # noqa: BLE001 - 一個失敗不能拖累其他收尾
+                print(f"關閉 {label} 時失敗：{type(error).__name__}: {error}",
+                      file=sys.stderr, flush=True)
 
     app = FastAPI(title="台股即時大單追蹤", lifespan=lifespan)
 
@@ -421,17 +429,47 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
 
     @app.get("/api/feed")
     def feed_status() -> dict:
-        return _combined_feed_status(feed, futures_feed)
+        return _combined_feed_status(feed, futures_poller)
+
+    @app.get("/api/futures")
+    def futures() -> dict:
+        """台指期即時報價 ＋ 當日 1 分 K ＋ 均線。
+
+        刻意做成獨立的輪詢端點而非併進 /ws 推播：來源本身就是每 5 秒輪詢
+        一次的 REST（見 app/futures.py），沒有「有新成交就推」這回事，
+        接進推播管道只是讓兩種節奏不同的資料共用一條路而已。回傳 status
+        讓畫面在還沒有第一筆資料時也能講出原因（連線中／不可用／未啟用），
+        不是留一塊空白面板。"""
+        if futures_poller is None:
+            return {"enabled": False, "status": _futures_status(None), "quote": None}
+        return {"enabled": True, "status": futures_poller.status(),
+                "quote": futures_poller.snapshot()}
+
+    @app.get("/api/futures/daily")
+    def futures_daily() -> dict:
+        """台指期歷史日 K ＋均線（連續近月）。
+
+        與 /api/futures 分開兩支端點：日 K 一天只變一次、一份約 250 根，
+        塞進每 5 秒輪詢一次的即時報價裡等於每小時重傳 720 遍同樣的東西。
+        這裡是阻塞式 I/O（打期交所下載 CSV，首次約 3 秒、之後走當日快取），
+        路由刻意用同步 def 讓 FastAPI 丟到工作執行緒——絕不能出現在事件
+        迴圈上，否則一次查詢會卡住所有 /ws 推播（與 /api/history 同理）。
+        """
+        if futures_poller is None:
+            raise HTTPException(status_code=404, detail="期貨追蹤未啟用")
+        try:
+            return futures_daily_cache.get(futures_poller.product or "TXF")
+        except TaifexError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
 
     @app.get("/api/snapshot/{symbol}")
     def snapshot(symbol: str) -> dict:
-        owner_state, owner_feed, market = _lookup_market(symbol)
-        if owner_state is None:
+        if not state.has_symbol(symbol):
             raise HTTPException(
                 status_code=404, detail=f"symbol not tracked: {symbol}"
             ) from None
-        snap = owner_state.snapshot(symbol)
-        return {**_annotate_subscribed(snap, symbol, owner_feed), "market": market}
+        snap = state.snapshot(symbol)
+        return {**_annotate_subscribed(snap, symbol, feed), "market": "stock"}
 
     @app.get("/api/history/{symbol}")
     def history(symbol: str) -> dict:
@@ -463,28 +501,20 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
 
     @app.post("/api/threshold")
     def set_threshold(body: ThresholdIn) -> dict:
-        # body.symbol 為 None（套用全部）時沿用 Task 19 之前的行為，只套用
-        # 股票——期貨有自己獨立的預設門檻（--futures-large-order），不該被
-        # 「套用全部」這個股票專屬的動作意外改到，兩種單位（張／口）混在一起
-        # 套同一個數字也沒有意義。只有明確指定 symbol、且那個代碼是期貨時才
-        # 路由到 futures_state。
-        target_state = state
-        if (body.symbol is not None and not state.has_symbol(body.symbol)
-                and futures_state is not None and futures_state.has_symbol(body.symbol)):
-            target_state = futures_state
+        # 大單門檻是股票專屬的概念：期貨已不再收逐筆成交，沒有「大單」可篩。
         try:
-            target_state.set_threshold(body.large_order_lots, body.symbol)
+            state.set_threshold(body.large_order_lots, body.symbol)
         except KeyError:
             raise HTTPException(
                 status_code=404, detail=f"symbol not tracked: {body.symbol}"
             ) from None
         # 同上：symbols 可能在執行中被增刪，取一份複本再迭代。
-        with target_state.lock:
+        with state.lock:
             targets = ([body.symbol] if body.symbol is not None
-                      else list(target_state.symbols))
+                      else list(state.symbols))
         for symbol in targets:
             broadcaster.publish(symbol)
-        return {"thresholds": _all_thresholds()}
+        return {"thresholds": state.thresholds}
 
     @app.websocket("/ws")
     async def stream(websocket: WebSocket) -> None:
@@ -493,12 +523,12 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
         # 27 ms）。在事件迴圈上等這把鎖會讓所有連線與所有 HTTP 請求一起停擺，
         # 因此把等待丟到工作執行緒。同步 def 路由本來就跑在工作執行緒上。
         snapshots, thresholds = await asyncio.to_thread(
-            lambda: (_all_market_snapshots(), _all_thresholds()))
+            lambda: (_all_market_snapshots(), state.thresholds))
         # feed.status() 不碰 MarketState 的鎖，只讀幾個屬性，不必 to_thread。
         await websocket.send_json({"type": "init",
                                    "snapshots": snapshots,
                                    "thresholds": thresholds,
-                                   "feed": _combined_feed_status(feed, futures_feed)})
+                                   "feed": _combined_feed_status(feed, futures_poller)})
         queue = broadcaster.subscribe()
         try:
             while True:
@@ -546,25 +576,22 @@ def create_app(state: MarketState, broadcaster: Broadcaster, feed=None, *,
                             # 綁 name=name 是必要的：這是 for 迴圈裡定義的閉包，
                             # 不綁的話所有 to_thread 呼叫會共用最後一輪迴圈的
                             # name（經典的閉包晚繫結陷阱）。
-                            owner_state, owner_feed, market = _lookup_market(name)
-                            if owner_state is None:
-                                return None
                             try:
-                                snap = owner_state.snapshot(name)
+                                snap = state.snapshot(name)
                             except KeyError:
                                 # Task 14：這檔代碼可能在 publish 進佇列之後、
                                 # 這裡取快照之前被 DELETE /api/symbols/{symbol}
                                 # 移除，安靜跳過即可，不必讓整條 ws 連線掛掉。
                                 return None
-                            return {**_annotate_subscribed(snap, name, owner_feed),
-                                    "market": market}
+                            return {**_annotate_subscribed(snap, name, feed),
+                                    "market": "stock"}
 
                         payload = await asyncio.to_thread(_fetch)
                         if payload is None:
                             continue
                         await websocket.send_json({
                             "type": "update", "snapshot": payload,
-                            "feed": _combined_feed_status(feed, futures_feed)})
+                            "feed": _combined_feed_status(feed, futures_poller)})
 
                 if disconnected:
                     break

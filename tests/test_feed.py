@@ -57,6 +57,24 @@ class FakeStock:
             handler(None, None)
 
 
+def make_rest_client(pages: list[dict]):
+    """連上之後每次都會跑 _backfill()，所以假 SDK 也得有 RestClient。
+    回傳的類別會把第一頁吐成 `pages`，之後回空頁結束分頁。"""
+
+    class FakeRestClient:
+        calls: list[dict] = []
+
+        def __init__(self, **kwargs):
+            self.stock = types.SimpleNamespace(
+                intraday=types.SimpleNamespace(trades=self._trades))
+
+        def _trades(self, **params):
+            FakeRestClient.calls.append(params)
+            return {"data": list(pages) if params["offset"] == 0 else []}
+
+    return FakeRestClient
+
+
 @pytest.fixture
 def fake_sdk(monkeypatch):
     timeline = []
@@ -70,6 +88,7 @@ def fake_sdk(monkeypatch):
     sdk = types.ModuleType("fugle_marketdata")
     sdk.WebSocketClient = make_client
     sdk.HealthCheckConfig = lambda **kwargs: kwargs
+    sdk.RestClient = make_rest_client([])
     monkeypatch.setitem(sys.modules, "fugle_marketdata", sdk)
     certifi = types.ModuleType("certifi")
     certifi.where = lambda: "/dev/null"
@@ -410,6 +429,155 @@ def test_d_backfill_replays_missed_rest_trades_into_on_trade(monkeypatch):
     assert [t["serial"] for t in seen] == [501, 502]
     assert all(t["symbol"] == "2330" for t in seen), "REST 沒有 symbol 欄位，要自己補上"
     assert calls[0] == {"symbol": "2330", "limit": 500, "offset": 0}
+
+
+# -- Task 20：connect() 卡死（實地事故）-----------------------------------------
+#
+# 2026-08-13 16:09 斷線後，程式整整 17 小時沒有再收到任何一則行情，一條執行緒
+# 燒掉 1073 分鐘 CPU（99% 單核），/api/feed 的 state 凍在 "reconnecting"、
+# reconnects 停在 9 不動，隔天開盤完全沒有資料。
+#
+# 原因在 SDK 而不在我們：fugle_marketdata 的 WebSocketClient.connect() 是
+#
+#     Thread(target=self.__ws.run_forever).start()
+#     while True:                                   # 沒有 sleep 的 busy-wait
+#         if self.auth_status in [AUTHENTICATED, UNAUTHENTICATED]:
+#             break
+#
+# auth_status 只有在 socket 真的 open、觸發 connect 事件、跑到 __authenticate()
+# 之後才會離開 PENDING（那條路徑上還有 SDK 自己的 5 秒 auth timer 兜底）。
+# socket 從頭到尾沒開起來時，__authenticate() 不會被呼叫，auth_status 永遠是
+# PENDING，這個迴圈就永遠不會 break —— connect() 不返回也不拋例外。
+#
+# 於是 run() 卡在 stock.connect() 那一行：走不到 _state = "connected"，也走不到
+# _wake_event.wait()，整個重連迴圈死掉。看門狗每 15 秒呼叫的 disconnect() 也
+# 救不了 —— SDK 的 disconnect() 最後一行正是 auth_status = PENDING。
+
+
+class HangingStock:
+    """connect() 永不返回：照抄 SDK busy-wait 的形狀（只是加了 sleep，
+    測試不需要真的燒 CPU）。auth_status 用 SDK 的數值：0=PENDING、
+    2=AUTHENTICATED、3=UNAUTHENTICATED。"""
+
+    def __init__(self):
+        self.handlers = {}
+        self.auth_status = 0                   # PENDING，且沒有人會改變它
+        self.entered = threading.Event()       # connect() 已經進入 busy-wait
+        self.released = threading.Event()      # busy-wait 被解開、執行緒回收
+        self.disconnects = 0
+
+    def on(self, event, listener):
+        self.handlers[event] = listener
+
+    def subscribe(self, params):
+        pass
+
+    def connect(self):
+        self.entered.set()
+        while self.auth_status not in (2, 3):
+            time.sleep(0.005)
+        self.released.set()
+
+    def disconnect(self):
+        self.disconnects += 1
+        # SDK 的 disconnect() 真的會這樣做——正是它救不了卡死的原因。
+        self.auth_status = 0
+
+
+def test_connect_that_never_returns_is_abandoned_and_the_loop_keeps_reconnecting(
+        monkeypatch, capsys):
+    """connect() 不返回也不拋例外時，重連迴圈不能跟著死：要在逾時後放棄那個
+    client、解開 busy-wait 回收執行緒，然後照常建立全新的 client 重試。"""
+    created = []
+
+    def make_client(**kwargs):
+        stock = HangingStock()
+        created.append(stock)
+        return types.SimpleNamespace(stock=stock)
+
+    sdk = types.ModuleType("fugle_marketdata")
+    sdk.WebSocketClient = make_client
+    sdk.HealthCheckConfig = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "fugle_marketdata", sdk)
+    certifi = types.ModuleType("certifi")
+    certifi.where = lambda: "/dev/null"
+    monkeypatch.setitem(sys.modules, "certifi", certifi)
+
+    feed = FugleFeed("k", ["2330"], lambda t: None, connect_timeout_seconds=0.3)
+    feed._wait_before_reconnect = lambda seconds: feed._stop_event.wait(timeout=0)
+    thread = threading.Thread(target=feed.run, daemon=True)
+    thread.start()
+
+    try:
+        deadline = time.monotonic() + 5
+        while len(created) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(created) >= 2, (
+            "connect() 卡住時重連迴圈整個死掉：只建立了 "
+            f"{len(created)} 個 client，永遠沒有第二次嘗試")
+        assert created[0] is not created[1]
+
+        assert created[0].released.wait(timeout=2), (
+            "放棄的 client 還卡在 busy-wait：那條執行緒會燒滿一顆核心直到行程結束")
+        assert feed.reconnects >= 1
+    finally:
+        feed.stop()
+        thread.join(timeout=3)
+
+    assert "逾時" in capsys.readouterr().err, "放棄一次連線嘗試必須留下紀錄"
+
+
+def test_first_connection_also_backfills_the_day_so_far(monkeypatch):
+    """盤中重啟時，開盤到啟動之間的成交只能靠 REST 補回來。曾經只在
+    reconnects > 0 才補，於是重啟後畫面與 parquet 都從當下才開始有資料。"""
+    seen = []
+    trades_page = [{"price": 100, "size": 3, "time": 1, "serial": 501}]
+
+    stock = FakeStock([])
+
+    def make_client(**kwargs):
+        return types.SimpleNamespace(stock=stock)
+
+    sdk = types.ModuleType("fugle_marketdata")
+    sdk.WebSocketClient = make_client
+    sdk.HealthCheckConfig = lambda **kwargs: kwargs
+    sdk.RestClient = make_rest_client(trades_page)
+    monkeypatch.setitem(sys.modules, "fugle_marketdata", sdk)
+    certifi = types.ModuleType("certifi")
+    certifi.where = lambda: "/dev/null"
+    monkeypatch.setitem(sys.modules, "certifi", certifi)
+
+    feed = FugleFeed("k", ["2330"], seen.append)
+    thread = threading.Thread(target=feed.run, daemon=True)
+    thread.start()
+    assert stock.connected.wait(timeout=2), "初次連線沒有在時限內完成"
+    deadline = time.monotonic() + 2
+    while not seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    feed.stop()
+    thread.join(timeout=2)
+
+    assert feed.reconnects == 0, "這是第一次連線，還沒發生過重連"
+    assert [t["serial"] for t in seen] == [501], \
+        "第一次連線也要補當日已經發生的成交"
+
+
+def test_watchdog_does_not_fight_the_connect_attempt(monkeypatch):
+    """連線嘗試進行中，看門狗不該插手呼叫 disconnect()——SDK 的 disconnect()
+    會把 auth_status 設回 PENDING，正好是讓 busy-wait 永遠不 break 的值，
+    跟逾時放棄的邏輯互相打架。連線期間的超時已經由 connect 逾時負責。"""
+    feed = FugleFeed("k", ["2330"], lambda t: None, stale_after_seconds=90)
+    stock = HangingStock()
+    feed._stock = stock
+    feed.last_message_at = time.monotonic() - 91      # 早就過期
+
+    feed._connecting = True
+    feed._watchdog_tick()
+    assert stock.disconnects == 0, "連線嘗試進行中，看門狗不該介入"
+
+    feed._connecting = False
+    feed._watchdog_tick()
+    assert stock.disconnects == 1, "連線建立之後，閒置過久仍要主動斷線觸發重連"
 
 
 # -- Task 14 C：盤中動態增刪標的 ----------------------------------------------

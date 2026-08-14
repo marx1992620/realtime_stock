@@ -4,9 +4,9 @@ import types
 import pyarrow.parquet as pq
 import pytest
 
-from app.__main__ import (DEFAULT_FUTURES_LARGE_ORDER_LOTS, MAX_SUBSCRIPTIONS, Pipeline,
-                          build_writers, fetch_names, parse_args)
-from app.futures import DEFAULT_FUTURES_SYMBOL, futures_trade_value_twd
+from app.__main__ import (MAX_SUBSCRIPTIONS, Pipeline, build_writers, fetch_names,
+                          parse_args)
+from app.futures import DEFAULT_FUTURES_PRODUCT, DEFAULT_POLL_SECONDS
 from app.storage import ParquetTradeWriter
 from app.web import Broadcaster, MarketState
 
@@ -94,17 +94,19 @@ def test_default_threshold_applies_to_every_symbol():
         "2330": default, "2317": default}
 
 
-# -- 期貨（Task 19 D）------------------------------------------------------
+# -- 期貨 ------------------------------------------------------------------
 
-def test_futures_flag_defaults_to_txfr1_and_empty_string_disables():
-    """使用者要求：預設就訂閱台指期近一合約；傳空字串明確停用。"""
-    assert parse_args(["--symbols", "2330"]).futures == "TXFR1" == DEFAULT_FUTURES_SYMBOL
+def test_futures_flag_defaults_to_the_txf_product_and_empty_string_disables():
+    """--futures 收的是**商品代號**（TXF）而不是合約代碼：近月每月會換
+    （TXFH6-F → TXFI6-F），要使用者自己跟著改設定沒有道理，改由
+    app.futures.discover_near_month 每次啟動時查。傳空字串明確停用。"""
+    assert parse_args(["--symbols", "2330"]).futures == "TXF" == DEFAULT_FUTURES_PRODUCT
     assert parse_args(["--symbols", "2330", "--futures", ""]).futures == ""
 
 
-def test_futures_large_order_defaults_to_ten_lots():
+def test_futures_interval_defaults_to_the_poller_default():
     args = parse_args(["--symbols", "2330"])
-    assert args.futures_large_order == DEFAULT_FUTURES_LARGE_ORDER_LOTS == 10
+    assert args.futures_interval == DEFAULT_POLL_SECONDS == 5.0
 
 
 # -- 訂閱預算 -------------------------------------------------------------
@@ -200,26 +202,6 @@ def test_pipeline_aggregates_and_persists_trade(tmp_path):
     # 記憶體紀錄仍帶 is_large，但落檔的是可重算的欄位而非當下門檻的旗標
     assert "is_large" not in table.column_names
     assert state.aggregator("2330").trades[0]["is_large"] is True
-
-
-def test_pipeline_applies_value_twd_fn_when_given_for_futures(tmp_path):
-    """Task 19 C：期貨的 value_twd 用契約乘數（price*size*200），不是股票的
-    price*lots*1000——透過 Pipeline 的 value_twd_fn 掛勾覆寫，不改
-    aggregator.py／classify.py。不傳這個參數（股票用的 Pipeline）行為不變，
-    見 test_pipeline_aggregates_and_persists_trade。"""
-    state = MarketState(["TXFR1"], large_order_lots=1)
-    writers = {"TXFR1": ParquetTradeWriter(tmp_path / "trades_TXFR1.parquet", batch_size=1)}
-    pipeline = Pipeline(state, Broadcaster(), writers,
-                        value_twd_fn=lambda t: futures_trade_value_twd(t["price"], t["size"]))
-
-    trade = {"symbol": "TXFR1", "price": 17000, "size": 3, "bid": 16995, "ask": 17000,
-             "time": 1, "serial": 1}
-    pipeline.handle_trade(trade)
-    pipeline.close()
-
-    assert state.snapshot("TXFR1")["ladder"][0]["buy_lots"] == 3
-    row = pq.read_table(tmp_path / "trades_TXFR1.parquet").to_pylist()[0]
-    assert row["value_twd"] == 17000 * 3 * 200 == 10_200_000
 
 
 def test_pipeline_does_not_persist_duplicate_serial(tmp_path):

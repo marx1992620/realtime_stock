@@ -109,6 +109,17 @@
   .key.sell { background: var(--sell); }
   .key.close { width: 14px; height: 2px; border-radius: 1px; background: var(--ink); }
   .key.line { width: 14px; height: 2px; border-radius: 1px; }
+  /* 圖不貼齊 section 邊緣：寬度 95%、置中，左右各留 2.5% 的空隙。
+     捲軸與圖必須被同一個 .chart-wrap 包住，它們的百分比才有同一個基準
+     ——否則捲軸會以整個 section 為寬度基準，跟圖對不齊。 */
+  .chart-wrap { width: 95%; margin: 0 auto; }
+  /* K棒圖（股票日K／期貨1分K）比大單流向圖再小一號：95% × 0.95 = 90.25%。
+     兩個旋鈕分工：渲染寬度只由這裡的容器寬度決定（改 HCH.w 動不了它，只會改
+     內部座標密度）；渲染高度 = 渲染寬度 × HCH.h / HCH.w，所以「圖變扁」要去
+     調 HCH.h，見該處註解。 */
+  /* max-width 才是真正讓圖不再佔滿螢幕的那一項：百分比是相對值，螢幕越寬圖
+     就越大，縮 5% 追不上。窄螢幕上 max-width 不生效，仍由百分比自適應。 */
+  .chart-wrap.candle { width: 85.74%; max-width: 1350px; }
   .chart { width: 100%; height: auto; display: block; overflow: visible; }
   .chart .gridline { stroke: var(--grid); stroke-width: 1; }
   .chart .zero { stroke: var(--axis); stroke-width: 1; }
@@ -131,6 +142,28 @@
   .chart .hchit { fill: var(--ink); opacity: 0; cursor: crosshair; }
   .chart .hchit:hover { opacity: .07; }
   .hint { color: var(--muted-ink); font-size: .85em; }
+
+  /* K棒圖的橫向捲軸。用原生 <input type="range"> 而不是把圖塞進 overflow-x
+     的容器：圖是等比縮放的 SVG（viewBox 撐滿寬度），沒有「比容器寬」的
+     溢出可捲；能左右移動的是**資料視窗**（顯示第幾根到第幾根），那正好
+     就是一個一維的值，range 是它最貼切的控制項，也自帶鍵盤操作。
+     左右內縮對齊繪圖區，見 chartScrollHTML。 */
+  .chart-scroll { display: block; margin-top: .3rem; height: 12px;
+                  -webkit-appearance: none; appearance: none;
+                  background: transparent; cursor: pointer; }
+  .chart-scroll::-webkit-slider-runnable-track {
+    height: 8px; border-radius: 4px; background: var(--grid); }
+  .chart-scroll::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 44px; height: 8px; border: none; border-radius: 4px;
+    background: var(--axis); }
+  .chart-scroll:hover::-webkit-slider-thumb { background: var(--muted-ink); }
+  .chart-scroll::-moz-range-track {
+    height: 8px; border-radius: 4px; background: var(--grid); }
+  .chart-scroll::-moz-range-thumb {
+    width: 44px; height: 8px; border: none; border-radius: 4px;
+    background: var(--axis); }
+  .chart-scroll:hover::-moz-range-thumb { background: var(--muted-ink); }
 
   #tip { position: fixed; z-index: 10; pointer-events: none;
          background: var(--surface); color: var(--ink);
@@ -159,9 +192,18 @@
 <script>
 const state = {
   snapshots: {}, symbols: [], active: null, feed: null,
-  // -- 歷史K棒 + 均線（Task 17）：client 端快取，切分頁不必每次都重打
-  // /api/history（伺服器端也快取，但這裡再省一次 HTTP 往返與重繪）。
-  historyCache: {}, historyView: {}, historyLoading: {}, historyError: {},
+  // -- K棒圖：所有圖共用這四個 map，以 chart key 區分（股票代碼、期貨合約
+  // 代碼、FUT_DAILY_KEY）。client 端快取讓切分頁不必每次重打 API，
+  // chartView 存各張圖自己的縮放/捲動位置。
+  chartData: {}, chartView: {}, chartLoading: {}, chartError: {},
+  // -- 台指期：即時報價 ＋ 當日 1 分K，來自 GET /api/futures 的輪詢。
+  // 不進 snapshots／symbols——那兩個是股票逐筆聚合的東西，期貨沒有逐筆
+  // 資料，形狀完全不同，混在一起只會讓每個讀取點都要先判斷市場別。
+  futuresEnabled: false, futuresQuote: null, futuresStatus: null,
+  // 拖 K 棒圖捲軸的期間，擋掉行情更新觸發的整塊重畫（見 render()）。
+  chartDragging: false,
+  // 使用者是否自己點過分頁。false 時期貨會被設成預設分頁（見 pollFutures）。
+  tabChosen: false,
 };
 const fmt = n => (n ?? 0).toLocaleString("zh-TW");
 const money = n => (n ?? 0).toLocaleString("zh-TW", { maximumFractionDigits: 0 });
@@ -213,7 +255,7 @@ function tradeTable(rows, title, unit) {
 // 原生 SVG，無任何外部套件。柱＝大單張數（買向上、賣向下，零線在中間），
 // 折線＝股價（右軸）。雙軸是使用者指定的；因此兩軸都標單位，格線只屬於
 // 左軸，避免暗示兩個尺度之間有什麼固定關係。
-const CH = { w: 880, h: 300, ml: 64, mr: 64, mt: 18, mb: 30 };
+const CH = { w: 880, h: 285, ml: 64, mr: 64, mt: 18, mb: 30 };
 const BUCKET_US = 5 * 60 * 1e6;
 
 function niceCeil(v) {
@@ -332,6 +374,7 @@ function flowChart(snap, unit) {
       <span><i class="key sell"></i>賣（向下）</span>
       <span><i class="key close"></i>股價</span>
     </div>
+    <div class="chart-wrap">
     <svg class="chart" viewBox="0 0 ${CH.w} ${CH.h}" preserveAspectRatio="xMidYMid meet"
          role="img" aria-label="每五分鐘大單買賣張數與股價">
       ${grid}${bars}${line}${notes}${times}${rightTicks}
@@ -340,15 +383,62 @@ function flowChart(snap, unit) {
       <text class="axis-title" x="${CH.w - 12}" y="${CH.mt + plotH / 2}" text-anchor="middle"
             transform="rotate(90 ${CH.w - 12} ${CH.mt + plotH / 2})">股價（元）</text>
       ${hits}
-    </svg>`;
+    </svg>
+    </div>`;
 }
 
 // -- 歷史K棒 + 均線圖（Task 17）-------------------------------------------
 // 通用元件：只依賴 /api/history/{symbol} 回傳的 {symbol,name,candles,ma}，
 // 不知道也不需要知道背後是股票還是（日後的）期貨合約。原生 SVG，無套件。
-const HCH = { w: 880, h: 320, ml: 60, mr: 16, mt: 16, mb: 34 };
-const MA_PERIODS = [5, 10, 20, 60, 120];
+// h 是「圖多扁」的旋鈕：SVG 以容器寬度等比縮放，渲染高度 = 渲染寬度 × h/w。
+// 304 → 280 讓繪圖區從 254 矮成 230（plotH = h - mt - mb），字級與線寬不受影響
+// ——那些跟著寬度走的縮放比例沒有變。
+const HCH = { w: 880, h: 280, ml: 60, mr: 16, mt: 16, mb: 34 };
 const MIN_VISIBLE_BARS = 20;
+
+// 均線週期由資料本身決定，不寫死一份清單：股票日K是 5/10/20/60/120，
+// 期貨1分K是 5/10/20/60（一般交易時段只有 300 分鐘，120 期均線要到收盤前
+// 才畫得出一小段，佔著圖例卻幾乎沒有資訊）。寫死的話期貨那張圖會對著不
+// 存在的 ma["120"] 讀出 undefined，圖例也會多一條永遠畫不出來的線。
+const chartPeriods = data => Object.keys(data.ma || {}).map(Number).sort((a, b) => a - b);
+// x 軸標籤：日K的 date 是 "2026-08-13"（只取月日），分K是 "11:16"（原樣顯示）。
+const barLabel = d => (String(d).includes(":") ? d : String(d).slice(5));
+// 圖例與提示框裡的週期單位：期貨的 payload 會帶 bar_unit="分"，股票沒帶就是日。
+const barUnit = data => data.bar_unit || "日";
+
+// 期貨分頁的識別字。用固定的哨符而不是合約代碼：合約代碼（TXFH6-F）要等
+// 第一次輪詢成功才知道，而分頁在那之前就要畫得出來（不然「正在取得行情」
+// 這句話沒有地方顯示）；每月換月時代碼也會變，分頁不該跟著換身分。
+const FUTURES_TAB = "__futures__";
+// 期貨歷史日K的 chart key。它與 1 分K 同屬一個合約，不能共用 key，否則
+// 兩張圖會共用同一份縮放狀態、同一組 DOM id，拖其中一張會動到另一張。
+const FUT_DAILY_KEY = "__futures_daily__";
+
+const CHART_TITLES = {
+  stock: "歷史日K + 均線",
+  fut1m: "當日 1 分K + 均線",
+  futDaily: "歷史日K + 均線（連續近月）",
+};
+
+// 一頁可以同時有多張 K 棒圖（期貨分頁就有 1 分K 與 日K 兩張），所以每張圖的
+// DOM id 都由它的 chart key 推導，不能再共用一組固定的 "history*" id——
+// 兩張圖搶同一個 id 時，後面那張的捲軸會去操作前面那張的圖。
+function chartIds(key) {
+  const slug = String(key).replace(/[^\w-]/g, "_");
+  return { box: `chartbox-${slug}`, svg: `chartsvg-${slug}`,
+           scroll: `chartscroll-${slug}`, hint: `charthint-${slug}` };
+}
+
+// 所有圖的資料都放同一個 map，取用端不必知道它是誰抓來的：
+// 股票日K 來自 /api/history、期貨1分K 來自 /api/futures 的輪詢、
+// 期貨日K 來自 /api/futures/daily。
+const chartDataFor = key => state.chartData[key];
+
+// 目前分頁上「主要那張圖」的 key（股票是代碼，期貨是合約代碼）。
+function activeChartSymbol() {
+  return state.active === FUTURES_TAB
+    ? (state.futuresQuote && state.futuresQuote.symbol) : state.active;
+}
 
 // 預設看最近 90 根；資料不足 90 根就整段顯示。
 function defaultHistoryView(total) {
@@ -370,23 +460,15 @@ function priceTicks(min, max, count = 5) {
   return Array.from({ length: count }, (_, i) => min + (max - min) * i / (count - 1));
 }
 
-function historyChartHTML(symbol) {
-  const title = `<h2>歷史日K + 均線</h2>`;
-  if (state.historyError[symbol]) {
-    return `${title}<p class="muted" style="color: var(--bad)">${esc(state.historyError[symbol])}</p>`;
-  }
-  const data = state.historyCache[symbol];
-  if (!data) return `${title}<p class="muted">載入中…</p>`;
-  if (!data.candles.length) return `${title}<p class="muted">尚無資料</p>`;
-  return candleChart(data);
-}
-
-function candleChart(data) {
-  const { symbol, candles, ma } = data;
+// 只畫 <svg> 本身（不含標題、圖例、捲軸）：拖捲軸與滾輪縮放都只重畫這一段。
+function candleChartSvg(key, chartTitle) {
+  const data = chartDataFor(key);
+  const { candles, ma } = data;
+  const periods = chartPeriods(data);
   const total = candles.length;
   const view = clampHistoryView(
-    state.historyView[symbol] || defaultHistoryView(total), total);
-  state.historyView[symbol] = view;
+    state.chartView[key] || defaultHistoryView(total), total);
+  state.chartView[key] = view;
   const { start, count } = view;
   const visible = candles.slice(start, start + count);
 
@@ -399,7 +481,7 @@ function candleChart(data) {
   const drawBody = bodyW >= 1;
 
   // y 軸範圍依目前可見區間的蠟燭高低點自動調整，不是固定全期。刻意不把
-  // 均線的值也算進來撐開範圍——長週期均線（例如 120 日）縮到很短的窗口
+  // 均線的值也算進來撐開範圍——長週期均線（例如 60 期）縮到很短的窗口
   // 時常常會偏離當下價格很多，若把它也算進 y 軸，蠟燭會被擠成一小條，
   // 反而更難看懂。均線超出範圍的部分改用 clipPath 在圖表邊界切齊
   // （見下方 <clipPath>），效果等同「線跑出圖外」，跟大部分看盤軟體一致。
@@ -408,6 +490,9 @@ function candleChart(data) {
   const pad = (hi - lo) * 0.06 || Math.max(1, hi * 0.02);
   lo -= pad; hi += pad;
   const priceY = p => HCH.mt + (hi - p) / (hi - lo) * plotH;
+
+  const ids = chartIds(key);
+  const clipId = `clip-${ids.svg}`;      // clipPath 的 id 也要逐張唯一
 
   const grid = priceTicks(lo, hi).map(v => {
     const y = priceY(v);
@@ -434,7 +519,7 @@ function candleChart(data) {
   // 均線：null 的區段要斷開，不可跨過空值直連——每遇到 null 就重新
   // "M" 起筆，而不是接著 "L" 畫過去。
   let maPaths = "";
-  MA_PERIODS.forEach(period => {
+  periods.forEach(period => {
     const arr = ma[String(period)];
     let d = "", drawing = false;
     for (let i = 0; i < count; i++) {
@@ -448,7 +533,7 @@ function candleChart(data) {
     if (d) maPaths += `<path class="ma-line" d="${d}" stroke="var(--ma${period})"/>`;
   });
 
-  // x 軸：依縮放程度疏化，日期像素間距太近就往左捨棄（最新一根一定留著）。
+  // x 軸：依縮放程度疏化，標籤像素間距太近就往左捨棄（最新一根一定留著）。
   const step = Math.max(1, Math.ceil(count / 8));
   const wanted = [];
   for (let i = 0; i < count; i += step) wanted.push(i);
@@ -460,29 +545,21 @@ function candleChart(data) {
   }
   const dateLabels = kept.map(({ i, x }) =>
     `<text class="tick" x="${x}" y="${HCH.mt + plotH + 18}" text-anchor="middle">${
-      visible[i].date.slice(5)}</text>`).join("");
+      barLabel(visible[i].date)}</text>`).join("");
 
+  // hit 區塊帶上 data-key：提示框靠它分辨游標在哪一張圖上。
   const hits = visible.map((_, i) =>
-    `<rect class="hchit" data-i="${i}" x="${HCH.ml + i * slot}" y="${HCH.mt}" `
-    + `width="${slot}" height="${plotH}"/>`).join("");
+    `<rect class="hchit" data-i="${i}" data-key="${esc(key)}" `
+    + `x="${HCH.ml + i * slot}" y="${HCH.mt}" width="${slot}" height="${plotH}"/>`).join("");
 
-  const legend = `<div class="legend">
-      <span><i class="key buy"></i>漲</span>
-      <span><i class="key sell"></i>跌</span>
-      ${MA_PERIODS.map(p =>
-        `<span><i class="key line" style="background:var(--ma${p})"></i>${p}日均線</span>`
-      ).join("")}
-    </div>`;
-
-  return `<h2>歷史日K + 均線 <span class="hint">${esc(data.name || symbol)}・顯示 ${count} / ${total} 根・滾輪縮放</span></h2>
-    ${legend}
-    <svg class="chart" id="historyChartSvg" viewBox="0 0 ${HCH.w} ${HCH.h}" preserveAspectRatio="xMidYMid meet"
-         role="img" aria-label="歷史日K棒與移動平均線">
+  return `<svg class="chart" id="${ids.svg}" viewBox="0 0 ${HCH.w} ${HCH.h}"
+         preserveAspectRatio="xMidYMid meet"
+         role="img" aria-label="${esc(chartTitle)}">
       <defs>
-        <clipPath id="historyClip"><rect x="${HCH.ml}" y="${HCH.mt}" width="${plotW}" height="${plotH}"/></clipPath>
+        <clipPath id="${clipId}"><rect x="${HCH.ml}" y="${HCH.mt}" width="${plotW}" height="${plotH}"/></clipPath>
       </defs>
       ${grid}
-      <g clip-path="url(#historyClip)">${wicks}${bodies}${maPaths}</g>
+      <g clip-path="url(#${clipId})">${wicks}${bodies}${maPaths}</g>
       ${dateLabels}
       <text class="axis-title" x="14" y="${HCH.mt + plotH / 2}" text-anchor="middle"
             transform="rotate(-90 14 ${HCH.mt + plotH / 2})">價格（元）</text>
@@ -490,17 +567,83 @@ function candleChart(data) {
     </svg>`;
 }
 
+// 整塊圖：標題 + 圖例 + 圖 + 橫向捲軸。圖本身另外包一層 .chart-wrap > #box，
+// 拖捲軸時只換 #box 的內容，捲軸自己的 DOM 節點不動——瀏覽器在拖曳中途
+// 若把 <input> 換掉，那次拖曳會直接中斷，手感變成「拖一格就斷」。
+function candleChart(key, chartTitle) {
+  const data = chartDataFor(key);
+  const total = data.candles.length;
+  // 先把視窗夾好寫回 state 再組字串：chartHint 在樣板裡排在 candleChartSvg
+  // 之前求值，若等 candleChartSvg 才寫入，第一次渲染的標題會顯示
+  // 「顯示 undefined / N 根」。
+  const { start, count } = state.chartView[key] = clampHistoryView(
+    state.chartView[key] || defaultHistoryView(total), total);
+  const ids = chartIds(key);
+  return `<h2>${chartTitle} <span class="hint" id="${ids.hint}">${chartHint(key)}</span></h2>
+    ${chartLegend(data)}
+    <div class="chart-wrap candle">
+      <div id="${ids.box}">${candleChartSvg(key, chartTitle)}</div>
+      ${chartScrollHTML(key, total, start, count)}
+    </div>`;
+}
+
+// 一整塊圖（含「載入中」「載入失敗」的狀態），給任何分頁重複使用。
+function chartSection(key, chartTitle) {
+  if (state.chartError[key]) {
+    return `<h2>${chartTitle}</h2>
+      <p class="muted" style="color: var(--bad)">${esc(state.chartError[key])}</p>`;
+  }
+  const data = chartDataFor(key);
+  if (!data) return `<h2>${chartTitle}</h2><p class="muted">載入中…</p>`;
+  if (!data.candles.length) return `<h2>${chartTitle}</h2><p class="muted">尚無資料</p>`;
+  return candleChart(key, chartTitle);
+}
+
+function chartHint(key) {
+  const data = chartDataFor(key);
+  const view = state.chartView[key] || {};
+  return `${esc(data.name || data.symbol)}・顯示 ${view.count} / ${data.candles.length} 根`
+       + `・滾輪縮放、下方捲軸左右移動`;
+}
+
+function chartLegend(data) {
+  const unit = barUnit(data);
+  return `<div class="legend">
+      <span><i class="key buy"></i>漲</span>
+      <span><i class="key sell"></i>跌</span>
+      ${chartPeriods(data).map(p =>
+        `<span><i class="key line" style="background:var(--ma${p})"></i>${p}${unit}均線</span>`
+      ).join("")}
+    </div>`;
+}
+
+// 捲軸只在「看不完」時才出現：count === total 時沒有東西可捲，留一條永遠
+// 拖不動的軌道只會讓人以為壞了。左右內縮對齊繪圖區（ml/mr 佔 viewBox 的
+// 比例），滑桿的位置才對得上圖上實際的位置。
+function chartScrollHTML(key, total, start, count) {
+  if (count >= total) return "";
+  const left = HCH.ml / HCH.w * 100;
+  const width = (HCH.w - HCH.ml - HCH.mr) / HCH.w * 100;
+  return `<input type="range" class="chart-scroll" id="${chartIds(key).scroll}"
+    min="0" max="${total - count}" step="1" value="${start}"
+    style="margin-left:${left}%; width:${width}%"
+    aria-label="左右移動K棒圖的顯示區間">`;
+}
+
 // 滾輪縮放：以游標位置為錨點——縮放前後，游標底下那根K棒要留在原地，
 // 不能整張圖只錨在右端（那樣放大時使用者看到的內容會整個跳掉）。
-function onHistoryWheel(event, symbol) {
+function onHistoryWheel(event, key, chartTitle) {
   event.preventDefault();                 // 不擋住就會整頁跟著捲動
-  const data = state.historyCache[symbol];
+  const data = chartDataFor(key);
   if (!data) return;
   const total = data.candles.length;
   const view = clampHistoryView(
-    state.historyView[symbol] || defaultHistoryView(total), total);
+    state.chartView[key] || defaultHistoryView(total), total);
 
-  const rect = event.currentTarget.getBoundingClientRect();
+  // 量的是 <svg> 而不是外層容器：外層可能有 padding／寬度不同，用錯基準
+  // 會讓錨點偏掉，放大時游標底下那根就不會留在原地。
+  const svg = document.getElementById(chartIds(key).svg) || event.currentTarget;
+  const rect = svg.getBoundingClientRect();
   const scaleX = HCH.w / rect.width;                 // viewBox 座標 ≠ CSS 像素
   const px = (event.clientX - rect.left) * scaleX;
   const plotW = HCH.w - HCH.ml - HCH.mr;
@@ -511,60 +654,143 @@ function onHistoryWheel(event, symbol) {
   const nextCount = view.count * factor;
   const nextStart = anchorIdx - frac * nextCount;      // 保持錨點在同一個像素位置
 
-  state.historyView[symbol] = clampHistoryView(
+  state.chartView[key] = clampHistoryView(
     { start: nextStart, count: nextCount }, total);
-  refreshHistoryBox(symbol);
+  redrawChart(key, chartTitle);
 }
 
-function historyTipHTML(symbol, localIndex) {
-  const data = state.historyCache[symbol];
-  const view = state.historyView[symbol];
+// 只重畫 <svg>，並把捲軸的 max/value 同步過去（縮放會改變可捲範圍：放大
+// 到剩 20 根時能捲的距離最大，縮到全部時捲軸該消失）。捲軸節點本身不重建，
+// 拖曳中途才不會斷掉。
+function redrawChart(key, chartTitle) {
+  const data = chartDataFor(key);
+  const ids = chartIds(key);
+  const box = document.getElementById(ids.box);
+  if (!data || !box) return;
+  box.innerHTML = candleChartSvg(key, chartTitle);
+
+  const { start, count } = state.chartView[key];
+  const total = data.candles.length;
+  const scroll = document.getElementById(ids.scroll);
+  if (scroll) {
+    if (count >= total) {
+      scroll.remove();                       // 縮到看得完整份，就不需要捲軸了
+    } else {
+      scroll.max = String(total - count);
+      scroll.value = String(start);
+    }
+  } else if (count < total) {
+    // 從「看得完」縮放回「看不完」：把捲軸補回來（緊接在圖後面）。
+    box.insertAdjacentHTML("afterend", chartScrollHTML(key, total, start, count));
+    bindChartScroll(key, chartTitle);
+  }
+
+  const hint = document.getElementById(ids.hint);
+  if (hint) hint.innerHTML = chartHint(key);
+}
+
+function onHistoryScroll(event, key, chartTitle) {
+  const data = chartDataFor(key);
+  if (!data) return;
+  const view = state.chartView[key];
+  state.chartView[key] = clampHistoryView(
+    { start: Number(event.currentTarget.value), count: view.count },
+    data.candles.length);
+  redrawChart(key, chartTitle);
+}
+
+function historyTipHTML(key, localIndex) {
+  const data = chartDataFor(key);
+  const view = state.chartView[key];
   if (!data || !view) return null;
   const c = data.candles[view.start + localIndex];
   if (!c) return null;
-  const maLine = MA_PERIODS.map(p => {
+  const unit = barUnit(data);
+  const maLine = chartPeriods(data).map(p => {
     const v = data.ma[String(p)][view.start + localIndex];
-    return `${p}日 ${v != null ? v.toFixed(2) : "—"}`;
+    return `${p}${unit} ${v != null ? v.toFixed(2) : "—"}`;
   }).join("　");
   return `<b>${c.date}</b><br>開 ${c.open}　高 ${c.high}　低 ${c.low}　收 ${c.close}<br>
     量 ${fmt(c.volume)}<br><span class="muted">${maLine}</span>`;
 }
 
-// 只重繪歷史圖那個容器，不動整個面板——縮放時不該把價位階梯的捲動位置
-// 或門檻輸入框的游標一起弄丟。
-function refreshHistoryBox(symbol) {
-  if (symbol !== state.active) return;     // 分頁已經切走，這次更新過期了
-  const box = document.getElementById("historyChartBox");
-  if (!box) return;
-  box.innerHTML = historyChartHTML(symbol);
-  bindHistoryChart(symbol);
+// 滾輪縮放與捲軸都綁在這裡。滾輪刻意綁在外層的 #box 而不是 <svg> 本身：
+// 每次重畫都會換掉裡面那個 <svg>，綁在它身上的 handler 會跟著消失，綁在
+// 不會被替換的外層則靠事件冒泡照樣收得到。
+function bindChartControls(key, chartTitle) {
+  const box = document.getElementById(chartIds(key).box);
+  if (box) box.addEventListener("wheel",
+    event => onHistoryWheel(event, key, chartTitle), { passive: false });
+  bindChartScroll(key, chartTitle);
 }
 
-async function ensureHistory(symbol) {
-  if (state.historyCache[symbol] || state.historyLoading[symbol]) return;
-  state.historyLoading[symbol] = true;
-  state.historyError[symbol] = null;
+function bindChartScroll(key, chartTitle) {
+  const scroll = document.getElementById(chartIds(key).scroll);
+  if (!scroll) return;
+  scroll.addEventListener("input", event => onHistoryScroll(event, key, chartTitle));
+  // 拖曳期間把整塊重畫擋下來（見 render() 開頭），否則手上的滑桿節點會被
+  // 換掉、拖曳當場中斷。
+  scroll.addEventListener("pointerdown", () => { state.chartDragging = true; });
+}
+
+// 放開滑鼠就解除封鎖，並補畫一次把拖曳期間擋掉的更新一次補上。
+//
+// 監聽掛在 document 而不是滑桿本身，是因為滑桿節點會被重畫換掉：若 pointerup
+// 的監聽跟著那個節點一起消失，旗標就永遠停在 true，整個畫面從此不再更新
+// ——那比原本的 bug 嚴重得多。掛在 document 上的這一份只註冊一次、永遠存在，
+// 不論指標最後在哪裡放開（拖出視窗、拖到別的元素上）都收得到。
+function finishChartDrag() {
+  if (!state.chartDragging) return;
+  state.chartDragging = false;
+  render();
+}
+document.addEventListener("pointerup", finishChartDrag);
+document.addEventListener("pointercancel", finishChartDrag);
+// 指標在視窗外放開時 pointerup 不會送達，改由這個補；也涵蓋切到別的分頁。
+window.addEventListener("blur", finishChartDrag);
+
+// 通用的「載入一張圖的資料」：股票日K 打 /api/history，期貨日K 打
+// /api/futures/daily。兩者的回應形狀相同（{symbol,name,candles,ma}），
+// 差別只有位址與 key，所以共用同一支。
+async function ensureChart(key, url, chartTitle) {
+  if (state.chartData[key] || state.chartLoading[key]) return;
+  state.chartLoading[key] = true;
+  state.chartError[key] = null;
   try {
-    const response = await fetch(`/api/history/${encodeURIComponent(symbol)}`);
+    const response = await fetch(url);
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
-      state.historyError[symbol] = body.detail || `載入失敗（HTTP ${response.status}）`;
+      state.chartError[key] = body.detail || `載入失敗（HTTP ${response.status}）`;
       return;
     }
-    state.historyCache[symbol] = body;
-    state.historyView[symbol] = defaultHistoryView(body.candles.length);
+    state.chartData[key] = body;
+    state.chartView[key] = defaultHistoryView(body.candles.length);
   } catch {
-    state.historyError[symbol] = "載入失敗：無法連線到伺服器";
+    state.chartError[key] = "載入失敗：無法連線到伺服器";
   } finally {
-    state.historyLoading[symbol] = false;
-    refreshHistoryBox(symbol);
+    state.chartLoading[key] = false;
+    refreshChartBox(key, chartTitle);
   }
 }
 
-function bindHistoryChart(symbol) {
-  const svg = document.getElementById("historyChartSvg");
-  if (svg) svg.addEventListener("wheel", event => onHistoryWheel(event, symbol), { passive: false });
-  ensureHistory(symbol);                   // 已快取或載入中時是 no-op
+const ensureHistory = symbol =>
+  ensureChart(symbol, `/api/history/${encodeURIComponent(symbol)}`, CHART_TITLES.stock);
+const ensureFuturesDaily = () =>
+  ensureChart(FUT_DAILY_KEY, "/api/futures/daily", CHART_TITLES.futDaily);
+
+// 只重繪某一張圖的容器，不動整個面板——載入完成時不該把價位階梯的捲動
+// 位置或門檻輸入框的游標一起弄丟。
+function refreshChartBox(key, chartTitle) {
+  const section = document.getElementById(`section-${chartIds(key).box}`);
+  if (!section) return;                     // 分頁已經切走，這次更新過期了
+  section.innerHTML = chartSection(key, chartTitle);
+  bindChartControls(key, chartTitle);
+}
+
+// 一整個 <section>：外面包一層固定 id，載入完成後才找得到要換的容器。
+function chartSectionHTML(key, chartTitle) {
+  return `<section class="wide" id="section-${chartIds(key).box}">${
+    chartSection(key, chartTitle)}</section>`;
 }
 
 // 重繪前後保留使用者的位置與輸入。整塊替換 innerHTML 每秒最多發生 5 次
@@ -584,27 +810,91 @@ function restoreScroll(panels, offsets) {
   });
 }
 
-// 期貨分頁（Task 19 D）：單位字樣顯示「口」而非「張」，不顯示歷史K棒圖
-// （stock.historical.candles 對期貨代碼無效，futopt.historical 目前 403），
-// 且期貨連線多半會被拒（帳號只有一條連線配額）——面板不能只是安靜地
-// 全部掛零，要把原因講出來，不然使用者分不出「行情清淡」還是「根本沒接上」。
-function futuresStatusNotice() {
-  const f = state.feed && state.feed.futures;
+// -- 台指期分頁 ------------------------------------------------------------
+// 期貨這一頁只有兩件事：即時價格與 1 分 K，沒有逐筆成交、沒有大單、沒有
+// 每價位成交量——資料來源是期交所 MIS 的即時行情（見 app/futures.py），
+// 那邊本來就不提供逐筆委託／成交的單量明細。因此它不共用股票的 render()，
+// 而是自己一小段版面；資料也不走 /ws 推播，改用 GET /api/futures 輪詢
+// （來源本身就是每 5 秒一次的 REST，沒有「有新成交就推」這回事）。
+function futuresNotice() {
+  const f = state.futuresStatus;
   if (!f || f.state === "connected") return "";
   const reason = {
     disabled: "期貨追蹤未啟用（啟動時可用 --futures 開啟）",
     unavailable: `期貨行情不可用：${f.unavailable_reason || "原因不明"}`,
-    reconnecting: "期貨連線中，尚未取得資料…",
-    stopped: "期貨連線已停止",
-  }[f.state] || `期貨連線狀態：${f.state}`;
+    reconnecting: `正在向期交所取得行情…${f.last_error ? `（${f.last_error}）` : ""}`,
+    stale: "期貨行情停滯：已超過 90 秒沒有成功更新，畫面上的數字不可信",
+    stopped: "期貨輪詢已停止",
+  }[f.state] || `期貨行情狀態：${f.state}`;
   return `<p class="muted" style="color: var(--bad)">⚠ ${esc(reason)}</p>`;
 }
 
+// 漲跌一律以「參考價」(CRefPrice，即前一交易日結算價) 為基準，與期交所
+// 網站同一個定義；用開盤價當基準會在跳空的日子整個對不上。
+const signed = (v, digits = 0) =>
+  v == null ? "—" : `${v > 0 ? "+" : ""}${v.toLocaleString("zh-TW", {
+    minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+
+function renderFutures() {
+  const panels = document.getElementById("panels");
+  const quote = state.futuresQuote;
+  const sessions = (quote && quote.sessions || [])
+    .map(s => `${s.Start.slice(0, 2)}:${s.Start.slice(2)}–${s.End.slice(0, 2)}:${s.End.slice(2)}`)
+    .join("、");
+
+  if (!quote) {
+    panels.innerHTML = `<section class="wide"><h2>台指期</h2>${futuresNotice()
+      || `<p class="muted">載入中…</p>`}</section>`;
+    return;
+  }
+
+  const up = quote.change != null && quote.change > 0;
+  const flat = quote.change == null || quote.change === 0;
+  const moveClass = flat ? "" : (up ? "buy" : "sell");
+
+  panels.innerHTML = `
+    <section>
+      <h2>${esc(`${quote.symbol} ${quote.name || ""}`.trim())}</h2>
+      ${futuresNotice()}
+      <div class="price ${moveClass}">${quote.last_price != null ? fmt(quote.last_price) : "—"}</div>
+      <div class="${moveClass}">${signed(quote.change)}　${
+        quote.change_pct != null ? `${signed(quote.change_pct, 2)}%` : ""}</div>
+      <div class="muted">最後一根 K 棒 ${esc(quote.bar_time || "—")}｜${esc(quote.date || "")}${
+        sessions ? `｜交易時段 ${esc(sessions)}` : ""}</div>
+      <table style="margin-top:.5rem">
+        <tr><th>開盤</th><td>${fmt(quote.open)}</td></tr>
+        <tr><th>最高</th><td class="buy">${fmt(quote.high)}</td></tr>
+        <tr><th>最低</th><td class="sell">${fmt(quote.low)}</td></tr>
+        <tr><th>參考價</th><td>${fmt(quote.ref_price)}</td></tr>
+        <tr><th>買價 / 賣價</th><td>${quote.bid != null ? fmt(quote.bid) : "—"} / ${
+          quote.ask != null ? fmt(quote.ask) : "—"}</td></tr>
+        <tr><th>漲停 / 跌停</th><td>${fmt(quote.limit_up)} / ${fmt(quote.limit_down)}</td></tr>
+        <tr><th>總量</th><td>${fmt(quote.volume)} 口</td></tr>
+      </table>
+      <div class="muted" style="margin-top:.4rem">資料來源：期交所 MIS 即時行情（每 ${
+        state.futuresStatus && state.futuresStatus.interval || 5} 秒更新）</div>
+    </section>
+    ${chartSectionHTML(quote.symbol, CHART_TITLES.fut1m)}
+    ${chartSectionHTML(FUT_DAILY_KEY, CHART_TITLES.futDaily)}`;
+
+  // 1 分K 的資料由 /api/futures 的輪詢供給（已寫進 state.chartData），
+  // 只要綁互動就好；歷史日K 走自己的端點，第一次進來才拉一次。
+  bindChartControls(quote.symbol, CHART_TITLES.fut1m);
+  bindChartControls(FUT_DAILY_KEY, CHART_TITLES.futDaily);
+  ensureFuturesDaily();                     // 已快取或載入中時是 no-op
+}
+
 function render() {
+  // 正在拖 K 棒圖的捲軸就不重畫。render() 會整塊換掉 #panels 的 innerHTML，
+  // 連帶把使用者手上那個 <input type="range"> 節點抽掉——瀏覽器的拖曳一旦
+  // 失去目標節點就直接結束，症狀正是「拖到一半就停住」。股票分頁每筆成交
+  // 都會經 ws 觸發 render（最快 5 次/秒），所以盤中幾乎拖不動。
+  // 擋掉的那幾次更新不會遺失：放開時 finishChartDrag() 會補畫一次。
+  if (state.chartDragging) return;
+  if (state.active === FUTURES_TAB) { renderFutures(); return; }
   const snap = state.snapshots[state.active];
   if (!snap) return;
-  const futures = snap.market === "futures";
-  const unit = futures ? "口" : "張";
+  const unit = "張";
   const panels = document.getElementById("panels");
   const offsets = scrollOffsets(panels);
   const input = document.getElementById("threshold");
@@ -613,7 +903,6 @@ function render() {
   panels.innerHTML = `
     <section>
       <h2>${label(snap)}</h2>
-      ${futures ? futuresStatusNotice() : ""}
       ${snap.subscribed === false ? `<p class="muted" style="color: var(--warn)">
         ⚠ 訂閱尚未獲得伺服器確認，這個分頁暫時不會有任何資料。</p>` : ""}
       <div class="price">${snap.last_price ?? "—"}</div>
@@ -635,7 +924,7 @@ function render() {
       </div>
     </section>
     <section class="wide">${flowChart(snap, unit)}</section>
-    ${futures ? "" : `<section class="wide" id="historyChartBox">${historyChartHTML(state.active)}</section>`}
+    ${chartSectionHTML(state.active, CHART_TITLES.stock)}
     <section>${ladderTable(snap.ladder, "當日每價位成交量")}</section>
     <section>${ladderTable(snap.large_ladder, `大單每價位成交量（≥ ${fmt(snap.large_order_lots)} ${unit}）`)}</section>
     <section>${tradeTable(snap.recent_trades, "近期成交明細", unit)}</section>`;
@@ -648,7 +937,8 @@ function render() {
   }
   fresh.onkeydown = event => { if (event.key === "Enter") applyThreshold(); };
   document.getElementById("apply").onclick = applyThreshold;
-  if (!futures) bindHistoryChart(state.active);   // 期貨不顯示歷史K棒，不必打 /api/history
+  bindChartControls(state.active, CHART_TITLES.stock);
+  ensureHistory(state.active);              // 已快取或載入中時是 no-op
 }
 
 async function applyThreshold() {
@@ -673,12 +963,12 @@ document.addEventListener("mousemove", event => {
   if (flowHit) {
     const snap = state.snapshots[state.active];
     const bucket = snap && (snap.buckets || [])[Number(flowHit.dataset.i)];
-    const unit = snap && snap.market === "futures" ? "口" : "張";
     if (bucket) html = `<b>${hhmm(bucket.t)}–${hhmm(bucket.t + BUCKET_US)}</b><br>
-      買 ${fmt(bucket.buy_lots)} ${unit}<br>賣 ${fmt(bucket.sell_lots)} ${unit}<br>
+      買 ${fmt(bucket.buy_lots)} 張<br>賣 ${fmt(bucket.sell_lots)} 張<br>
       收盤 ${bucket.close}`;
   } else if (histHit) {
-    html = historyTipHTML(state.active, Number(histHit.dataset.i));
+    // 一頁可能有多張圖，所以看 hit 自己帶的 key，不能再假設是當前分頁那張。
+    html = historyTipHTML(histHit.dataset.key, Number(histHit.dataset.i));
   }
   if (!html) { tip.hidden = true; return; }
   tip.innerHTML = html;
@@ -691,24 +981,37 @@ document.addEventListener("mousemove", event => {
 });
 
 function renderTabs() {
-  document.getElementById("tabs").innerHTML = state.symbols.map(s => {
+  const tabs = [];
+
+  // 期貨排在最前面且是預設分頁（見 pollFutures）。它固定由 --futures 決定、
+  // 無法從畫面上新增或移除，所以不給移除鈕——點了也只會打中股票專屬的
+  // DELETE /api/symbols 而 404。第一次輪詢成功前先顯示「台指期」。
+  if (state.futuresEnabled) {
+    const quote = state.futuresQuote;
+    const text = quote ? esc(`${quote.symbol} ${quote.name || ""}`.trim()) : "台指期";
+    tabs.push(`<span class="tab ${state.active === FUTURES_TAB ? "active" : ""}" `
+      + `data-symbol="${FUTURES_TAB}">${text}</span>`);
+  }
+
+  state.symbols.forEach(s => {
     const snap = state.snapshots[s];
     // 訂閱未獲確認的代碼不能看起來跟正常追蹤中的代碼一樣——那正是實測踩過
     // 的坑：新增的股票靜靜留在分頁上，永遠不會有任何資料。
     const warn = snap && snap.subscribed === false
       ? `<span class="muted" style="color: var(--warn)" title="訂閱尚未獲得伺服器確認，暫時不會有資料">⚠</span>`
       : "";
-    // 期貨分頁固定由 --futures 決定、無法從畫面上新增或移除（Task 19 D），
-    // 不給移除鈕；點了也只會打中股票專屬的 DELETE /api/symbols 而 404。
-    const isFutures = snap && snap.market === "futures";
-    const removeBtn = isFutures ? ""
-      : `<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button>`;
-    return `<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
-      warn}${label(snap)}${removeBtn}</span>`;
-  }).join("");
+    const removeBtn =
+      `<button class="tab-remove" data-symbol="${esc(s)}" title="移除 ${esc(s)}">×</button>`;
+    tabs.push(`<span class="tab ${s === state.active ? "active" : ""}" data-symbol="${esc(s)}">${
+      warn}${label(snap)}${removeBtn}</span>`);
+  });
+
+  document.getElementById("tabs").innerHTML = tabs.join("");
   document.querySelectorAll(".tab").forEach(el =>
     el.addEventListener("click", event => {
       if (event.target.closest(".tab-remove")) return;   // 交給移除鈕自己的 handler
+      // 使用者自己選過分頁之後，就不要再被「期貨是預設分頁」那段搶回去。
+      state.tabChosen = true;
       state.active = el.dataset.symbol; renderTabs(); render();
     }));
   document.querySelectorAll(".tab-remove").forEach(btn =>
@@ -758,6 +1061,7 @@ async function addSymbol() {
   // （新代碼還沒有任何成交時，快照本身就是合理的空狀態）。
   const snapResponse = await fetch(`/api/snapshot/${encodeURIComponent(symbol)}`);
   if (snapResponse.ok) state.snapshots[symbol] = await snapResponse.json();
+  state.tabChosen = true;          // 剛加的股票要留得住，不能被預設分頁搶走
   state.active = symbol;
   renderTabs();
   render();
@@ -779,7 +1083,11 @@ async function removeSymbol(symbol) {
   }
   delete state.snapshots[symbol];
   state.symbols = body.symbols;
-  if (state.active === symbol) state.active = state.symbols[0] ?? null;   // 切到第一個
+  // 切到第一檔；一檔股票都不剩時退到期貨分頁（若有），不要留在一個
+  // 已經被刪掉的代碼上讓畫面整個空掉。
+  if (state.active === symbol) {
+    state.active = state.symbols[0] ?? (state.futuresEnabled ? FUTURES_TAB : null);
+  }
   renderTabs();
   render();
 }
@@ -805,27 +1113,66 @@ function renderFeedStatus(combined) {
   renderFuturesStatus(combined.futures);
 }
 
-// 期貨連線健康度：獨立的一小行文字，不搶股票主狀態列的版面——這把 key
-// 上期貨幾乎必然是 unavailable（見 app/futures.py 檔頭的實測結果），要讓
-// 使用者一眼看到原因，又不能讓它蓋過「股票行情正常」這個更重要的訊號。
+// 期貨行情健康度：獨立的一小行文字，不搶股票主狀態列的版面——期貨是次要
+// 資訊，但斷掉時要看得出來，不能讓凍住的價格看起來像「盤面很安靜」。
 function renderFuturesStatus(feed) {
   const el = document.getElementById("futStatus");
   if (!el || !feed) return;
+  state.futuresStatus = feed;
   if (feed.state === "disabled") {
     el.textContent = "期貨：未啟用";
     el.title = "";
   } else if (feed.state === "connected") {
-    el.textContent = "期貨：行情正常";
-    el.title = "";
+    const ago = feed.last_message_ago;
+    el.textContent = `期貨：行情正常${ago != null ? `（${Math.round(ago)} 秒前）` : ""}`;
+    el.title = feed.source || "";
+  } else if (feed.state === "stale") {
+    el.textContent = "期貨：行情停滯";
+    el.title = feed.last_error || "已超過 90 秒沒有成功更新";
   } else if (feed.state === "unavailable") {
     el.textContent = "期貨：不可用";
     el.title = feed.unavailable_reason || "原因不明";
   } else {
     el.textContent = feed.reconnects > 0
-      ? `期貨：連線中（第 ${feed.reconnects} 次重試）`
-      : "期貨：連線中…";
-    el.title = "";
+      ? `期貨：重試中（第 ${feed.reconnects} 次）`
+      : "期貨：取得行情中…";
+    el.title = feed.last_error || "";
   }
+}
+
+// 期貨資料的輪詢。與 pollFeedStatus 分開是因為兩者的失敗語意不同：這支
+// 拿不到資料時畫面上該顯示的是「期貨行情不可用」，而不是把整個看盤畫面
+// 的健康度標成異常——股票那一條可能好得很。
+async function pollFutures() {
+  let body;
+  try {
+    const response = await fetch("/api/futures");
+    if (!response.ok) return;
+    body = await response.json();
+  } catch {
+    return;                     // 暫時的網路問題，維持上一次的畫面，下一輪再試
+  }
+  const hadTab = state.futuresEnabled;
+  const previousSymbol = state.futuresQuote && state.futuresQuote.symbol;
+  state.futuresEnabled = body.enabled;
+  state.futuresStatus = body.status;
+  if (body.quote) {
+    state.futuresQuote = body.quote;
+    // 1 分K 走同一份 chartData，K棒圖元件才不必知道資料是輪詢來的。
+    state.chartData[body.quote.symbol] = body.quote;
+  }
+  // 分頁只在「出現／消失」或合約換月時重畫，不必每 5 秒重建一次 DOM。
+  const nowSymbol = state.futuresQuote && state.futuresQuote.symbol;
+  if (hadTab !== state.futuresEnabled || previousSymbol !== nowSymbol) renderTabs();
+
+  // 期貨是預設分頁：第一次確認它可用時，若使用者還沒自己點過任何分頁，
+  // 就切過去。之所以不是在 ws 的 init 直接寫死，是因為那時還不知道期貨
+  // 有沒有啟用（--futures "" 可以關掉），而這兩件事誰先到並不固定。
+  if (state.futuresEnabled && !state.tabChosen && state.active !== FUTURES_TAB) {
+    state.active = FUTURES_TAB;
+    renderTabs();
+  }
+  if (state.active === FUTURES_TAB) render();      // 拖曳中的攔截在 render() 裡
 }
 
 function renderStockStatus(feed) {
@@ -865,6 +1212,10 @@ async function pollFeedStatus() {
 }
 pollFeedStatus();
 setInterval(pollFeedStatus, 5000);
+// 與伺服器端的輪詢間隔一致（app/futures.py 的 DEFAULT_POLL_SECONDS）。再快
+// 只會拿到同一份快照，因為那邊 5 秒才向期交所要一次。
+pollFutures();
+setInterval(pollFutures, 5000);
 
 // 由頁面協定推導 ws/wss：寫死 ws:// 時，只要頁面經 HTTPS 提供（例如放在
 // TLS 反向代理後），瀏覽器會以混合內容為由封鎖連線，整個畫面卡在「連線中…」。
